@@ -56,7 +56,12 @@ def build_model():
         [
             tf.keras.layers.RandomFlip("horizontal"),
             tf.keras.layers.RandomRotation(0.1),
-            tf.keras.layers.RandomBrightness(0.2),
+            # Skewed towards darkening (not just +/-20%) so the model also
+            # learns from dim/night-flash-lit frames, not just daylight ones.
+            # This only helps if data/ actually includes some night photos -
+            # see the README's "Detecting cats after dark" section.
+            tf.keras.layers.RandomBrightness((-0.4, 0.2)),
+            tf.keras.layers.RandomContrast(0.3),
             tf.keras.layers.RandomZoom(0.1),
         ]
     )

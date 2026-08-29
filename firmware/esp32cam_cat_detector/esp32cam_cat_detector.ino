@@ -32,6 +32,10 @@
 
 // GPIO 13 is free on this pinout (not used by the camera), so it's used for
 // the PIR sensor's digital output. GPIO 4 drives the onboard flash LED.
+// GPIO 14/15 drive the optional HC-SR04 ultrasonic sensor, and GPIO 33
+// (an ADC-capable pin) reads the optional LDR light sensor. See
+// config.example.h for wiring notes and how to disable the ultrasonic
+// sensor if you haven't wired one up.
 #define PIR_PIN    13
 #define FLASH_PIN   4
 
@@ -75,7 +79,42 @@ bool initCamera() {
     Serial.printf("Camera init failed with error 0x%x\n", err);
     return false;
   }
+
+  // Push the sensor towards its low-light-friendly settings. This doesn't
+  // hurt daytime shots (auto-exposure/auto-gain still adapt), but gives
+  // night captures (lit by the flash) noticeably less noise and better
+  // exposure.
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (sensor != nullptr) {
+    sensor->set_gainceiling(sensor, GAINCEILING_128X);
+    sensor->set_aec2(sensor, 1);
+    sensor->set_bpc(sensor, 1);
+    sensor->set_wpc(sensor, 1);
+  }
+
   return true;
+}
+
+// Reads the HC-SR04 and returns the distance in cm, or -1 if no echo was
+// received (e.g. sensor not connected, or nothing in range).
+long readUltrasonicDistanceCm() {
+  digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(ULTRASONIC_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+
+  // Timeout after ~30ms (~5m round trip) so a disconnected/faulty sensor
+  // can't stall the main loop.
+  unsigned long durationUs = pulseIn(ULTRASONIC_ECHO_PIN, HIGH, 30000UL);
+  if (durationUs == 0) {
+    return -1;
+  }
+  return durationUs / 58; // standard HC-SR04 microseconds-to-cm conversion
+}
+
+bool isDark() {
+  return analogRead(LDR_PIN) < DARK_ADC_THRESHOLD;
 }
 
 void connectWiFi() {
@@ -109,8 +148,9 @@ bool sendFrameToServer(camera_fb_t *fb) {
 }
 
 void captureAndSend() {
-  digitalWrite(FLASH_PIN, HIGH); // brief fill light helps the classifier
-  delay(50);
+  bool dark = isDark();
+  digitalWrite(FLASH_PIN, HIGH); // fill light helps the classifier see
+  delay(dark ? FLASH_WARMUP_DARK_MS : FLASH_WARMUP_MS);
 
   camera_fb_t *fb = esp_camera_fb_get();
   digitalWrite(FLASH_PIN, LOW);
@@ -130,6 +170,11 @@ void setup() {
   pinMode(FLASH_PIN, OUTPUT);
   digitalWrite(FLASH_PIN, LOW);
 
+  if (USE_ULTRASONIC) {
+    pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
+    pinMode(ULTRASONIC_ECHO_PIN, INPUT);
+  }
+
   if (!initCamera()) {
     Serial.println("Halting: camera init failed.");
     while (true) {
@@ -138,7 +183,9 @@ void setup() {
   }
 
   connectWiFi();
-  Serial.println("Ready - watching PIR sensor for motion.");
+  Serial.println("Ready - watching PIR" +
+                  String(USE_ULTRASONIC ? " + ultrasonic sensor" : " sensor") +
+                  " for motion.");
 }
 
 void loop() {
@@ -146,13 +193,22 @@ void loop() {
     connectWiFi();
   }
 
-  bool motionDetected = digitalRead(PIR_PIN) == HIGH;
+  bool pirTriggered = digitalRead(PIR_PIN) == HIGH;
+
+  bool ultrasonicTriggered = false;
+  if (USE_ULTRASONIC) {
+    long distanceCm = readUltrasonicDistanceCm();
+    ultrasonicTriggered = distanceCm > 0 && distanceCm <= ULTRASONIC_MAX_DISTANCE_CM;
+  }
+
+  bool motionDetected = pirTriggered || ultrasonicTriggered;
   unsigned long now = millis();
   bool cooldownElapsed =
       (now - lastCaptureMillis) >= (unsigned long)CAPTURE_COOLDOWN_SECONDS * 1000UL;
 
   if (motionDetected && cooldownElapsed) {
-    Serial.println("Motion detected - capturing frame.");
+    Serial.printf("Motion detected (PIR=%d, ultrasonic=%d, dark=%d) - capturing frame.\n",
+                  pirTriggered, ultrasonicTriggered, isDark());
     captureAndSend();
     lastCaptureMillis = now;
   }

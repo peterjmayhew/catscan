@@ -26,6 +26,12 @@ MODEL_PATH = os.path.join(MODEL_DIR, "cat_classifier.h5")
 STRIPY_SCORE_THRESHOLD = 18.0  # Laplacian-variance-based texture score
 CASCADE_MIN_NEIGHBORS = 8
 
+# Mean grayscale brightness (0-255) below which a frame is treated as
+# low-light - e.g. a night capture lit only by the ESP32-CAM's flash. Below
+# this, the heuristic path denoises and contrast-enhances the frame before
+# scoring it, and confidence is discounted since night frames are grainier.
+LOW_LIGHT_MEAN_THRESHOLD = 60.0
+
 
 class CatDetector:
     def __init__(self):
@@ -47,8 +53,22 @@ class CatDetector:
     def mode(self):
         return "model" if self._model is not None else "heuristic"
 
-    def find_cat_face(self, image_bgr):
+    def _mean_brightness(self, image_bgr):
         gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        return float(gray.mean())
+
+    def is_low_light(self, image_bgr):
+        return self._mean_brightness(image_bgr) < LOW_LIGHT_MEAN_THRESHOLD
+
+    def _enhance_low_light(self, gray):
+        denoised = cv2.fastNlMeansDenoising(gray, h=10)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        return clahe.apply(denoised)
+
+    def find_cat_face(self, image_bgr, enhance=False):
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        if enhance:
+            gray = self._enhance_low_light(gray)
         faces = self._face_cascade.detectMultiScale(
             gray, scaleFactor=1.05, minNeighbors=CASCADE_MIN_NEIGHBORS, minSize=(60, 60)
         )
@@ -57,15 +77,21 @@ class CatDetector:
         # Largest detected face = most likely the subject, not background clutter.
         return max(faces, key=lambda f: f[2] * f[3])
 
-    def _stripy_score(self, region_bgr):
+    def _stripy_score(self, region_bgr, enhance=False):
         gray = cv2.cvtColor(region_bgr, cv2.COLOR_BGR2GRAY)
         gray = cv2.resize(gray, (128, 128))
+        if enhance:
+            gray = self._enhance_low_light(gray)
         return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
     def classify(self, image_bgr):
+        low_light = self.is_low_light(image_bgr)
         if self._model is not None:
-            return self._classify_with_model(image_bgr)
-        return self._classify_heuristic(image_bgr)
+            result = self._classify_with_model(image_bgr)
+        else:
+            result = self._classify_heuristic(image_bgr, low_light)
+        result["low_light"] = low_light
+        return result
 
     def _classify_with_model(self, image_bgr):
         resized = cv2.resize(image_bgr, (224, 224))
@@ -82,8 +108,8 @@ class CatDetector:
             "mode": "model",
         }
 
-    def _classify_heuristic(self, image_bgr):
-        face = self.find_cat_face(image_bgr)
+    def _classify_heuristic(self, image_bgr, low_light=False):
+        face = self.find_cat_face(image_bgr, enhance=low_light)
         if face is None:
             return {
                 "cat_detected": False,
@@ -94,12 +120,16 @@ class CatDetector:
 
         x, y, w, h = face
         region = image_bgr[y : y + h, x : x + w]
-        score = self._stripy_score(region)
+        score = self._stripy_score(region, enhance=low_light)
         is_tabby = score >= STRIPY_SCORE_THRESHOLD
 
         # Turn distance from the threshold into a rough 0.5-1.0 confidence.
         spread = max(abs(score - STRIPY_SCORE_THRESHOLD), 0.0)
         confidence = min(0.5 + spread / (STRIPY_SCORE_THRESHOLD * 2), 0.99)
+        if low_light:
+            # Denoised/contrast-enhanced night frames are still noisier than
+            # daylight ones, so the heuristic is less trustworthy here.
+            confidence *= 0.85
 
         return {
             "cat_detected": True,

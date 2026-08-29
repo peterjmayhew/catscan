@@ -40,6 +40,37 @@ Longer answer:
   accuracy), an OV5640 module (5MP, autofocus) is a drop-in upgrade the
   Freenove board's socket also accepts — a "nice to have", not a blocker.
 
+## Detecting cats after dark
+
+Splitting this into two separate problems makes it much less daunting:
+
+- **Knowing something is there.** PIR (body heat) and the ultrasonic sensor
+  (reflected sound) added below both work exactly the same in pitch
+  darkness as in daylight. Triggering isn't a night-time problem at all.
+- **Getting the camera to actually see it.** This is the real challenge — a
+  2MP OV2640 with no illumination just captures black. This project handles
+  it the simplest way, with no extra hardware beyond what the kit already
+  has: the onboard white flash LED (GPIO 4) fires a brief pulse right
+  before every night capture (an LDR/light sensor decides when it's dark
+  enough to bother, see wiring below), and the firmware nudges the sensor's
+  gain/exposure settings to make the most of that light.
+- This is genuinely a compromise, not "true" night vision: the flash is
+  visible light, so it'll briefly light up the area (and the cat) each
+  time, and even with the flash, night frames are noisier/grainier than
+  daylight ones — expect somewhat lower classification confidence at night
+  (the server flags this via a `low_light` field in its response).
+- If you want proper invisible-light night vision instead, that needs a
+  hardware change: an IR LED illuminator (850nm/940nm) plus a camera module
+  with its IR-cut filter removed (stock OV2640/OV5640 modules include one,
+  which blocks the IR light you're trying to illuminate with). That's a
+  bigger step — a dedicated "NoIR" camera module, or physically removing
+  the tiny IR-cut glass from the lens barrel — and trades away accurate
+  daytime colour, so it isn't done here. The flash-based approach above is
+  the pragmatic default; treat the IR route as an optional future upgrade.
+- Whichever route you use, **include night-time captures in your training
+  set** (see `data/README.md`) — a classifier trained only on daylight
+  photos won't generalise well to grainy night ones.
+
 ## How it works
 
 ```
@@ -91,9 +122,30 @@ captures/                   - Auto-saved incoming photos, sorted by verdict
 2. A PIR motion sensor (the kit includes one) wired to **GPIO 13** and 5V/GND.
    GPIO 13 is one of the few pins on the AI-Thinker/Freenove pinout not used
    by the camera, so it's safe to use for the PIR's digital output.
-3. Power the board from 5V (camera + Wi-Fi draws more current than USB-only
+3. *(Optional but recommended)* An HC-SR04 ultrasonic sensor, wired to
+   **TRIG → GPIO 14**, **ECHO → GPIO 15** (through a voltage divider — see
+   below), plus 5V/GND. This is a second, independent motion trigger that
+   works identically in full darkness, unlike the camera. Set
+   `USE_ULTRASONIC` to `false` in `config.h` if you skip this — the PIR
+   alone is still enough to run the project.
+   - **Voltage divider required on ECHO**: the HC-SR04 outputs 5V, but the
+     ESP32's GPIOs only tolerate 3.3V. Wire a 1kΩ resistor in series from
+     ECHO to the ESP32 pin, then a 2kΩ resistor from that junction to GND.
+     Skipping this can damage the GPIO.
+4. *(Optional)* An LDR (photoresistor) in a voltage-divider pair with a
+   fixed resistor (e.g. 10kΩ), wired so more ambient light gives a higher
+   voltage, feeding **GPIO 33**. This lets the firmware decide when it's
+   dark enough to use a longer flash pulse (see "Detecting cats after
+   dark" above). Without one, `isDark()` will just read whatever GPIO 33
+   floats to — fine to leave disconnected if you don't need this, but wire
+   it up if you want the night-time flash behaviour to actually work.
+5. Power the board from 5V (camera + Wi-Fi draws more current than USB-only
    power on some boards can reliably supply — use the kit's dedicated 5V
    supply/programmer, not just a phone charger through a thin cable).
+
+Board pinouts vary slightly between ESP32-CAM clones/revisions — double
+check GPIO 14/15/33 are actually free on yours (some are shared with the
+microSD slot) before wiring, and adjust the `#define`s in `config.h` if not.
 
 ## Firmware setup
 
@@ -122,7 +174,9 @@ The server listens on `0.0.0.0:5000` by default (`PORT` env var to change
 it) and exposes:
 
 - `POST /detect` — body is a raw JPEG. Returns JSON:
-  `{"cat_detected": true, "label": "my_tabby", "confidence": 0.94}`
+  `{"cat_detected": true, "label": "my_tabby", "confidence": 0.94, "low_light": false}`
+  (`low_light: true` flags a dim/night frame, which the heuristic mode
+  handles with extra denoising/contrast enhancement and a lower confidence).
 - `GET /health` — simple liveness check.
 
 Every image the server receives is saved under `captures/<label>/` with a
