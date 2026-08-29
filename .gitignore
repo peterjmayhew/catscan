@@ -1,0 +1,20 @@
+# Firmware secrets
+firmware/esp32cam_cat_detector/config.h
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Trained models and captured/training images (large binary files - keep
+# your own copies out of git rather than bloating the repo)
+server/models/*.h5
+server/models/*.tflite
+captures/
+data/my_tabby/
+data/other_cat/
+data/no_cat/
+
+# OS cruft
+.DS_Store
