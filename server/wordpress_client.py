@@ -12,6 +12,7 @@ Leave WORDPRESS_URL unset to skip this entirely - it's optional.
 
 import logging
 import os
+import time
 
 import cv2
 import requests
@@ -38,6 +39,13 @@ def upload_detection(result, image_bgr, image_path):
         logger.warning("Failed to encode image, skipping WordPress upload")
         return None
 
+    capture_timestamp = result.get("capture_timestamp")
+    captured_at = (
+        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(capture_timestamp))
+        if capture_timestamp
+        else os.path.basename(image_path)  # fall back to receipt-time filename
+    )
+
     fields = {
         "label": result.get("label", "no_cat"),
         "cat_detected": str(bool(result.get("cat_detected", False))).lower(),
@@ -46,7 +54,7 @@ def upload_detection(result, image_bgr, image_path):
         "low_light": str(bool(result.get("low_light", False))).lower(),
         "frame_count": str(result.get("frame_count", 1)),
         "reasoning": result.get("reasoning", ""),
-        "captured_at": os.path.basename(image_path),
+        "captured_at": captured_at,
     }
     files = {"image": ("capture.jpg", buffer.tobytes(), "image/jpeg")}
     headers = {"X-API-Key": WORDPRESS_API_KEY}

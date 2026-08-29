@@ -14,8 +14,14 @@ if (!defined('ABSPATH')) {
 
 define('CATSCAN_POST_TYPE', 'catscan_detection');
 define('CATSCAN_OPTION_API_KEY', 'catscan_api_key');
+define('CATSCAN_OPTION_RETENTION_DAYS', 'catscan_retention_days');
+define('CATSCAN_OPTION_EMAIL_ALERTS', 'catscan_email_alerts');
 define('CATSCAN_VALID_LABELS', ['no_cat', 'my_cat', 'other_cat']);
 define('CATSCAN_MAX_UPLOAD_BYTES', 8 * 1024 * 1024); // 8MB, generous for a VGA/SVGA JPEG
+define('CATSCAN_CLEANUP_HOOK', 'catscan_daily_cleanup');
+define('CATSCAN_CLEANUP_BATCH_SIZE', 200); // per run, so a huge backlog can't time out a request
+define('CATSCAN_RATE_LIMIT_MAX', 30);   // requests
+define('CATSCAN_RATE_LIMIT_WINDOW', 60); // seconds
 
 /**
  * Activation: make sure an API key exists before anyone tries to configure
@@ -25,15 +31,57 @@ function catscan_activate() {
     if (!get_option(CATSCAN_OPTION_API_KEY)) {
         update_option(CATSCAN_OPTION_API_KEY, wp_generate_password(40, false, false));
     }
+    if (get_option(CATSCAN_OPTION_RETENTION_DAYS) === false) {
+        update_option(CATSCAN_OPTION_RETENTION_DAYS, 90);
+    }
+    if (get_option(CATSCAN_OPTION_EMAIL_ALERTS) === false) {
+        update_option(CATSCAN_OPTION_EMAIL_ALERTS, '1');
+    }
     catscan_register_post_type();
     flush_rewrite_rules();
+
+    if (!wp_next_scheduled(CATSCAN_CLEANUP_HOOK)) {
+        wp_schedule_event(time(), 'daily', CATSCAN_CLEANUP_HOOK);
+    }
 }
 register_activation_hook(__FILE__, 'catscan_activate');
 
 function catscan_deactivate() {
     flush_rewrite_rules();
+    wp_clear_scheduled_hook(CATSCAN_CLEANUP_HOOK);
 }
 register_deactivation_hook(__FILE__, 'catscan_deactivate');
+
+/**
+ * Retention cleanup: without this, detections (and their attached images)
+ * accumulate in the media library forever. Runs daily via WP-Cron; set
+ * the retention period to 0 on the settings page to disable it.
+ */
+function catscan_run_cleanup() {
+    $retention_days = (int) get_option(CATSCAN_OPTION_RETENTION_DAYS, 90);
+    if ($retention_days <= 0) {
+        return;
+    }
+
+    $old_posts = get_posts([
+        'post_type' => CATSCAN_POST_TYPE,
+        'post_status' => 'publish',
+        'posts_per_page' => CATSCAN_CLEANUP_BATCH_SIZE,
+        'fields' => 'ids',
+        'date_query' => [[
+            'before' => $retention_days . ' days ago',
+        ]],
+    ]);
+
+    foreach ($old_posts as $post_id) {
+        $attachment_id = get_post_thumbnail_id($post_id);
+        if ($attachment_id) {
+            wp_delete_attachment($attachment_id, true);
+        }
+        wp_delete_post($post_id, true);
+    }
+}
+add_action(CATSCAN_CLEANUP_HOOK, 'catscan_run_cleanup');
 
 /**
  * Custom post type: one post per logged detection (or per burst-of-frames
@@ -83,6 +131,36 @@ function catscan_check_api_key(WP_REST_Request $request) {
     if (!hash_equals($expected, $provided)) {
         return new WP_Error('catscan_unauthorized', 'Invalid API key.', ['status' => 401]);
     }
+    if (!catscan_check_rate_limit()) {
+        return new WP_Error('catscan_rate_limited', 'Too many requests.', ['status' => 429]);
+    }
+    return true;
+}
+
+/**
+ * Basic fixed-window rate limit (abuse protection if the API key ever
+ * leaks) via transients - no extra tables, works on any host. A single
+ * ESP32-CAM sends nowhere near this volume in normal use.
+ */
+function catscan_check_rate_limit() {
+    $window_start = get_transient('catscan_rl_window_start');
+
+    if ($window_start === false) {
+        set_transient('catscan_rl_window_start', time(), CATSCAN_RATE_LIMIT_WINDOW);
+        set_transient('catscan_rl_count', 1, CATSCAN_RATE_LIMIT_WINDOW);
+        return true;
+    }
+
+    $count = (int) get_transient('catscan_rl_count');
+    if ($count >= CATSCAN_RATE_LIMIT_MAX) {
+        return false;
+    }
+
+    // Keep the count transient's expiry in sync with the window's actual
+    // remaining time, rather than resetting it to the full window on every
+    // request (which would let a steady trickle of requests never expire).
+    $remaining = max(1, CATSCAN_RATE_LIMIT_WINDOW - (time() - (int) $window_start));
+    set_transient('catscan_rl_count', $count + 1, $remaining);
     return true;
 }
 
@@ -133,11 +211,28 @@ function catscan_handle_detection_upload(WP_REST_Request $request) {
         set_post_thumbnail($post_id, $attachment_id);
     }
 
+    if ($label === 'other_cat' && get_option(CATSCAN_OPTION_EMAIL_ALERTS, '1')) {
+        catscan_send_alert_email($post_id, $attachment_id);
+    }
+
     return new WP_REST_Response([
         'success' => true,
         'post_id' => $post_id,
         'image_url' => $attachment_id ? wp_get_attachment_url($attachment_id) : null,
     ], 201);
+}
+
+function catscan_send_alert_email($post_id, $attachment_id) {
+    $subject = sprintf('[%s] Other cat detected', get_bloginfo('name'));
+    $edit_url = admin_url('post.php?post=' . absint($post_id) . '&action=edit');
+
+    $body = "CatScan just logged a visit from a cat that isn't yours.\n\n";
+    if ($attachment_id) {
+        $body .= 'Photo: ' . wp_get_attachment_url($attachment_id) . "\n\n";
+    }
+    $body .= 'View in admin: ' . $edit_url . "\n";
+
+    wp_mail(get_option('admin_email'), $subject, $body);
 }
 
 function catscan_label_display_name($label) {
@@ -250,6 +345,46 @@ function catscan_admin_column_content($column, $post_id) {
 add_action('manage_' . CATSCAN_POST_TYPE . '_posts_custom_column', 'catscan_admin_column_content', 10, 2);
 
 /**
+ * Label filter dropdown on the admin list screen, so "just the other
+ * cat's visits" is a click away instead of scrolling through everything.
+ */
+function catscan_label_filter_dropdown($post_type) {
+    if ($post_type !== CATSCAN_POST_TYPE) {
+        return;
+    }
+    $selected = isset($_GET['catscan_label_filter']) ? sanitize_text_field(wp_unslash($_GET['catscan_label_filter'])) : '';
+    echo '<select name="catscan_label_filter">';
+    echo '<option value="">' . esc_html__('All labels', 'catscan-detections') . '</option>';
+    foreach (CATSCAN_VALID_LABELS as $label) {
+        printf(
+            '<option value="%s"%s>%s</option>',
+            esc_attr($label),
+            selected($selected, $label, false),
+            esc_html(catscan_label_display_name($label))
+        );
+    }
+    echo '</select>';
+}
+add_action('restrict_manage_posts', 'catscan_label_filter_dropdown');
+
+function catscan_filter_by_label($query) {
+    if (!is_admin() || !$query->is_main_query() || $query->get('post_type') !== CATSCAN_POST_TYPE) {
+        return;
+    }
+    if (empty($_GET['catscan_label_filter'])) {
+        return;
+    }
+    $label = sanitize_text_field(wp_unslash($_GET['catscan_label_filter']));
+    if (!in_array($label, CATSCAN_VALID_LABELS, true)) {
+        return;
+    }
+    $meta_query = (array) $query->get('meta_query');
+    $meta_query[] = ['key' => '_catscan_label', 'value' => $label];
+    $query->set('meta_query', $meta_query);
+}
+add_action('pre_get_posts', 'catscan_filter_by_label');
+
+/**
  * Settings page: shows the API key and endpoint URL the server needs, and
  * lets the admin regenerate the key if it's ever compromised.
  */
@@ -277,8 +412,20 @@ function catscan_render_settings_page() {
         echo '<div class="notice notice-success"><p>' . esc_html__('API key regenerated.', 'catscan-detections') . '</p></div>';
     }
 
+    if (
+        isset($_POST['catscan_save_settings'])
+        && check_admin_referer('catscan_save_settings_action', 'catscan_settings_nonce')
+    ) {
+        $retention_days = isset($_POST['catscan_retention_days']) ? max(0, (int) $_POST['catscan_retention_days']) : 90;
+        update_option(CATSCAN_OPTION_RETENTION_DAYS, $retention_days);
+        update_option(CATSCAN_OPTION_EMAIL_ALERTS, isset($_POST['catscan_email_alerts']) ? '1' : '');
+        echo '<div class="notice notice-success"><p>' . esc_html__('Settings saved.', 'catscan-detections') . '</p></div>';
+    }
+
     $api_key = get_option(CATSCAN_OPTION_API_KEY);
     $endpoint = esc_url(rest_url('catscan/v1/detections'));
+    $retention_days = (int) get_option(CATSCAN_OPTION_RETENTION_DAYS, 90);
+    $email_alerts = (bool) get_option(CATSCAN_OPTION_EMAIL_ALERTS, '1');
     ?>
     <div class="wrap">
         <h1>CatScan</h1>
@@ -301,6 +448,31 @@ function catscan_render_settings_page() {
             <?php wp_nonce_field('catscan_regenerate_key_action', 'catscan_nonce'); ?>
             <p class="description"><?php esc_html_e('Regenerating invalidates the current key immediately - update your server\'s WORDPRESS_API_KEY afterwards.', 'catscan-detections'); ?></p>
             <?php submit_button(__('Regenerate API key', 'catscan-detections'), 'delete', 'catscan_regenerate_key'); ?>
+        </form>
+        <hr>
+        <h2><?php esc_html_e('Settings', 'catscan-detections'); ?></h2>
+        <form method="post">
+            <?php wp_nonce_field('catscan_save_settings_action', 'catscan_settings_nonce'); ?>
+            <table class="form-table">
+                <tr>
+                    <th scope="row"><label for="catscan-retention"><?php esc_html_e('Keep detections for', 'catscan-detections'); ?></label></th>
+                    <td>
+                        <input id="catscan-retention" type="number" min="0" name="catscan_retention_days" value="<?php echo esc_attr($retention_days); ?>" class="small-text">
+                        <?php esc_html_e('days (0 = keep forever)', 'catscan-detections'); ?>
+                        <p class="description"><?php esc_html_e('Older detections and their photos are deleted automatically once a day.', 'catscan-detections'); ?></p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row"><?php esc_html_e('Email alerts', 'catscan-detections'); ?></th>
+                    <td>
+                        <label>
+                            <input type="checkbox" name="catscan_email_alerts" value="1" <?php checked($email_alerts); ?>>
+                            <?php esc_html_e('Email the site admin when an "other cat" visit is logged', 'catscan-detections'); ?>
+                        </label>
+                    </td>
+                </tr>
+            </table>
+            <?php submit_button(__('Save settings', 'catscan-detections'), 'primary', 'catscan_save_settings'); ?>
         </form>
         <hr>
         <p><?php esc_html_e('Display recent detections anywhere with the shortcode:', 'catscan-detections'); ?> <code>[catscan_recent limit="12" label="all"]</code></p>

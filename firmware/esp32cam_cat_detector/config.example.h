@@ -55,4 +55,25 @@
 #define BURST_FRAME_COUNT 3
 #define BURST_FRAME_DELAY_MS 400
 
+// Shared secret sent as the X-Device-Key header on every POST to /detect.
+// Optional (leave blank to skip): the server only checks it if its own
+// DEVICE_API_KEY environment variable is set. This is defense in depth
+// in case the server port is ever reachable beyond your LAN, not a
+// replacement for keeping the server itself off the public internet.
+#define DEVICE_API_KEY ""
+
+// Password for OTA updates (Sketch -> Upload Using... in Arduino IDE, once
+// the device shows up on your network). Change this from the default.
+#define OTA_PASSWORD "change-me"
+
+// The device restarts once a day at this hour (0-23, in whatever timezone
+// NTP_GMT_OFFSET_SEC/NTP_DST_OFFSET_SEC below describe) as cheap insurance
+// against memory fragmentation on a device meant to run unattended for
+// months. Requires NTP to have synced at least once; if it never syncs
+// (e.g. no internet), the device just never restarts on this schedule.
+#define DAILY_RESTART_HOUR 4
+#define NTP_SERVER "pool.ntp.org"
+#define NTP_GMT_OFFSET_SEC 0       // e.g. 3600 for UTC+1
+#define NTP_DST_OFFSET_SEC 0       // e.g. 3600 if your zone observes DST
+
 #endif

@@ -185,15 +185,32 @@ microSD slot) before wiring, and adjust the `#define`s in `config.h` if not.
 ## Firmware setup
 
 1. Open `firmware/esp32cam_cat_detector/esp32cam_cat_detector.ino` in the
-   Arduino IDE with the ESP32 board package installed.
+   Arduino IDE with the ESP32 board package installed (`ArduinoOTA` ships
+   with it - no extra library install needed).
 2. Copy `config.example.h` to `config.h` in the same folder and fill in your
    Wi-Fi SSID/password and the server's URL (e.g.
-   `http://192.168.1.50:5000/detect`). `config.h` is git-ignored so your
-   credentials never get committed.
+   `http://192.168.1.50:5000/detect`), and change `OTA_PASSWORD` from the
+   default. `config.h` is git-ignored so your credentials never get
+   committed.
 3. Board settings: **AI Thinker ESP32-CAM** (Freenove's board uses the same
-   pinout), Partition Scheme: "Huge APP (3MB No OTA)", PSRAM: Enabled.
-4. To flash: connect GPIO0 to GND, reset, upload, then disconnect GPIO0 and
-   reset again to run normally (standard ESP32-CAM flashing procedure).
+   pinout), PSRAM: Enabled. **Partition Scheme: pick one that supports
+   OTA** (e.g. "Default 4MB with spiffs (1.2MB APP/1.5MB SPIFFS)" or
+   "Minimal SPIFFS (1.9MB APP with OTA)") - a "No OTA" scheme has no room
+   for a second app image, so OTA updates will fail to write with one.
+4. To flash the **first time** (USB required): connect GPIO0 to GND, reset,
+   upload, then disconnect GPIO0 and reset again to run normally (standard
+   ESP32-CAM flashing procedure).
+5. **After that**, once it's on your Wi-Fi, update it wirelessly instead:
+   in the Arduino IDE, **Tools → Port** should list `catscan-esp32cam at
+   <ip>` as a network port - select it, hit Upload as normal, and enter
+   `OTA_PASSWORD` when prompted. No more physical access or GPIO0 jumper
+   needed for routine updates.
+
+The firmware also syncs time via NTP once connected (set
+`NTP_GMT_OFFSET_SEC`/`NTP_DST_OFFSET_SEC` in `config.h` for your timezone)
+so captures carry an accurate timestamp, and restarts itself once a day at
+`DAILY_RESTART_HOUR` as cheap insurance against memory fragmentation on a
+device meant to run unattended for months.
 
 ## Server setup
 
@@ -208,12 +225,14 @@ python3 app.py
 The server listens on `0.0.0.0:5000` by default (`PORT` env var to change
 it) and exposes:
 
-- `POST /detect` — body is a raw JPEG, one per frame. Returns that single
-  frame's own classification as JSON:
+- `POST /detect` — body is a raw JPEG, one per frame. Optional headers:
+  `X-Device-Key` (checked against `DEVICE_API_KEY` if you've set one) and
+  `X-Capture-Time` (Unix timestamp from the firmware's NTP-synced clock,
+  used for accurate capture timestamps instead of server receipt time).
+  Returns that single frame's own classification as JSON:
   `{"cat_detected": true, "label": "my_cat", "confidence": 0.94, "low_light": false}`
-  (`low_light: true` flags a dim/night frame). This is per-frame, not the
-  burst consensus - see "Multi-frame consensus" below for what actually
-  gets logged/uploaded.
+  This is per-frame, not the burst consensus - see "Multi-frame consensus"
+  below for what actually gets logged/uploaded.
 - `GET /health` — liveness check; also reports which backend is active
   (`"mode": "cloud" | "model" | "heuristic"`) and whether WordPress upload
   is configured.
@@ -236,6 +255,7 @@ become your training set for `train_classifier.py`.
 | `WORDPRESS_URL` | unset | Enables uploading detections to your WordPress site |
 | `WORDPRESS_API_KEY` | unset | From Settings → CatScan in WordPress admin |
 | `NOTIFY_WEBHOOK_URL` | unset | Generic webhook (ntfy.sh, Home Assistant, Discord, etc.), called on `other_cat` |
+| `DEVICE_API_KEY` | unset | If set, `/detect` requires a matching `X-Device-Key` header (set the same value as `DEVICE_API_KEY` in the firmware's `config.h`) |
 
 ## Training your own classifier
 
@@ -361,12 +381,28 @@ server POSTs the representative JPEG plus `label`, `confidence`,
 model's `reasoning` to `/wp-json/catscan/v1/detections`, authenticated with
 an `X-Api-Key` header. The plugin stores it as a "Cat Detection" post with
 the image as its featured image, viewable under its own admin menu (with
-label/confidence/mode columns) or via the `[catscan_recent limit="12"
+label/confidence/mode columns, plus a label filter dropdown to browse
+"just the other cat's visits") or via the `[catscan_recent limit="12"
 label="all"]` shortcode (label can be `all`, `my_cat`, `other_cat`, or
 `no_cat`) to show a gallery anywhere on the site.
 
 If `WORDPRESS_URL` is unset, this is skipped entirely - the rest of the
 project works the same without it.
+
+**Also on Settings → CatScan:**
+
+- **Retention** — old detections (and their photos) are deleted
+  automatically once a day via WP-Cron. Defaults to 90 days; set to 0 to
+  keep everything forever. Without this, every visit's photo accumulates
+  in your media library indefinitely.
+- **Email alerts** — on by default, emails the site admin whenever an
+  `other_cat` detection is logged, with the photo and a link straight to
+  it in WP admin. Independent of the server's `NOTIFY_WEBHOOK_URL` - use
+  either, both, or neither.
+
+The REST endpoint is also rate-limited (30 requests/minute by default) as
+abuse protection in case the API key ever leaks - far more than a single
+camera's normal traffic needs.
 
 ## Notifications (optional)
 

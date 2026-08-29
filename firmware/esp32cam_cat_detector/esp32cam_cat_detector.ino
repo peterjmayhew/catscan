@@ -7,8 +7,10 @@
 // Requires the "config.h" file (copy config.example.h -> config.h and fill
 // in your Wi-Fi + server details) and the ESP32 Arduino core installed.
 
+#include <ArduinoOTA.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <time.h>
 #include "esp_camera.h"
 #include "config.h"
 
@@ -40,6 +42,19 @@
 #define FLASH_PIN   4
 
 unsigned long lastCaptureMillis = 0;
+
+// Wi-Fi reconnect state - non-blocking with exponential backoff, so a
+// dropped connection doesn't freeze sensor polling the way a blocking
+// reconnect loop would.
+bool wifiWasConnected = false;
+unsigned long lastWifiAttemptMillis = 0;
+unsigned long wifiRetryDelayMs = 1000;
+const unsigned long WIFI_MAX_RETRY_DELAY_MS = 30000;
+
+// A sanity floor for treating the device clock as NTP-synced (well after
+// this project could possibly have been built) rather than its un-synced
+// default of "seconds since boot from 1970".
+const time_t NTP_SANITY_EPOCH = 1700000000; // 2023-11-14
 
 bool initCamera() {
   camera_config_t config;
@@ -117,34 +132,89 @@ bool isDark() {
   return analogRead(LDR_PIN) < DARK_ADC_THRESHOLD;
 }
 
-void connectWiFi() {
-  Serial.printf("Connecting to Wi-Fi \"%s\"...\n", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.printf("\nConnected, IP: %s\n", WiFi.localIP().toString().c_str());
+// Runs once each time Wi-Fi (re)connects: starts NTP sync and (re)arms OTA,
+// since both can need re-establishing after a connection drop.
+void onWiFiConnected() {
+  Serial.printf("Wi-Fi connected, IP: %s\n", WiFi.localIP().toString().c_str());
+  configTime(NTP_GMT_OFFSET_SEC, NTP_DST_OFFSET_SEC, NTP_SERVER);
+  ArduinoOTA.begin();
 }
 
-// Sends one JPEG frame to the server and returns true if the request
-// succeeded (regardless of what the server decided the frame contained).
-bool sendFrameToServer(camera_fb_t *fb) {
-  HTTPClient http;
-  http.begin(SERVER_URL);
-  http.addHeader("Content-Type", "image/jpeg");
-  int httpCode = http.POST(fb->buf, fb->len);
+// Non-blocking Wi-Fi maintenance: call every loop() iteration. Retries with
+// exponential backoff instead of blocking the whole device (and therefore
+// sensor polling) while waiting to reconnect.
+void maintainWiFi() {
+  bool connectedNow = WiFi.status() == WL_CONNECTED;
 
-  if (httpCode > 0) {
-    String response = http.getString();
-    Serial.printf("Server responded [%d]: %s\n", httpCode, response.c_str());
-  } else {
-    Serial.printf("POST failed: %s\n", http.errorToString(httpCode).c_str());
+  if (connectedNow && !wifiWasConnected) {
+    onWiFiConnected();
+    wifiRetryDelayMs = 1000;
+  }
+  wifiWasConnected = connectedNow;
+
+  if (connectedNow) {
+    return;
   }
 
-  http.end();
-  return httpCode > 0;
+  unsigned long now = millis();
+  if (now - lastWifiAttemptMillis < wifiRetryDelayMs) {
+    return;
+  }
+  lastWifiAttemptMillis = now;
+  Serial.printf("Wi-Fi not connected - retrying (next attempt in %lums if this fails)...\n",
+                wifiRetryDelayMs);
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  wifiRetryDelayMs = min(wifiRetryDelayMs * 2, WIFI_MAX_RETRY_DELAY_MS);
+}
+
+// Cheap insurance against memory fragmentation on a device meant to run
+// unattended for months: restart once a day at a quiet hour. No-ops until
+// NTP has actually synced at least once.
+void maybeRestartDaily() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 0)) {
+    return;
+  }
+  if (timeinfo.tm_hour == DAILY_RESTART_HOUR && timeinfo.tm_min == 0) {
+    Serial.println("Scheduled daily restart.");
+    delay(200); // let the serial message flush
+    ESP.restart();
+  }
+}
+
+// Sends one JPEG frame to the server, retrying once on failure (a single
+// dropped packet on a Wi-Fi hiccup shouldn't cost a whole frame out of an
+// already-short burst). Returns true if either attempt succeeded.
+bool sendFrameToServer(camera_fb_t *fb) {
+  for (int attempt = 1; attempt <= 2; attempt++) {
+    HTTPClient http;
+    http.begin(SERVER_URL);
+    http.addHeader("Content-Type", "image/jpeg");
+    if (strlen(DEVICE_API_KEY) > 0) {
+      http.addHeader("X-Device-Key", DEVICE_API_KEY);
+    }
+    time_t captureTime = time(nullptr);
+    if (captureTime > NTP_SANITY_EPOCH) {
+      http.addHeader("X-Capture-Time", String((unsigned long)captureTime));
+    }
+
+    int httpCode = http.POST(fb->buf, fb->len);
+
+    if (httpCode > 0) {
+      String response = http.getString();
+      Serial.printf("Server responded [%d]: %s\n", httpCode, response.c_str());
+      http.end();
+      return true;
+    }
+
+    Serial.printf("POST failed (attempt %d/2): %s\n", attempt, http.errorToString(httpCode).c_str());
+    http.end();
+    if (attempt == 1) {
+      delay(500);
+    }
+  }
+  return false;
 }
 
 // Captures BURST_FRAME_COUNT frames instead of one. A single frame is an
@@ -193,16 +263,33 @@ void setup() {
     }
   }
 
-  connectWiFi();
+  ArduinoOTA.setHostname("catscan-esp32cam");
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+
+  // Give the initial connection a bounded window at boot; if it doesn't
+  // succeed in time, maintainWiFi() takes over with backoff retries in the
+  // background rather than freezing the whole device waiting.
+  Serial.printf("Connecting to Wi-Fi \"%s\"...\n", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long connectStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - connectStart < 15000) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println();
+
   Serial.println("Ready - watching PIR" +
                   String(USE_ULTRASONIC ? " + ultrasonic sensor" : " sensor") +
                   " for motion.");
 }
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    connectWiFi();
+  maintainWiFi();
+  if (WiFi.status() == WL_CONNECTED) {
+    ArduinoOTA.handle();
   }
+  maybeRestartDaily();
 
   bool pirTriggered = digitalRead(PIR_PIN) == HIGH;
 
