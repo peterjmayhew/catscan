@@ -1,7 +1,7 @@
 """Fine-tunes a MobileNetV2 classifier on your own cat photos.
 
 Expects images sorted into:
-    data/my_tabby/*.jpg
+    data/my_cat/*.jpg
     data/other_cat/*.jpg
     data/no_cat/*.jpg
 

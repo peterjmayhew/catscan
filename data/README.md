@@ -5,13 +5,17 @@
 
 ```
 data/
-  my_tabby/    - photos of your tabby cat(s)
+  my_cat/      - photos of your own cat(s)
   other_cat/   - photos of the neighbour's cat (and any other cats you want
                  flagged as "not mine")
   no_cat/      - photos with no cat at all (empty patio, other animals,
                  leaves blowing past the PIR sensor, etc.) - important so
                  the model learns what "nothing to see here" looks like
 ```
+
+See also `data/reference_photos/README.md` if you're using the cloud AI
+backend instead of (or alongside) a trained model - it needs far fewer
+photos and no training step.
 
 ## Where to get the photos
 
@@ -26,7 +30,10 @@ you'll have a real-world dataset for free.
 - Aim for at least ~100 images per class; several hundred is better.
 - Include different times of day, lighting, and the cat at different
   distances/angles - that's the variation the camera will actually see.
-- If you have more than one tabby, include photos of all of them in
-  `my_tabby/` so the model learns "tabby coat pattern", not "this one cat".
+- If you have more than one cat, include photos of all of them in
+  `my_cat/` so the model learns "these specific cats", not just one of them.
+- If your neighbour's cat is also a tabby, make sure `other_cat/` includes
+  plenty of examples of it specifically - the model needs to see that a
+  tabby coat alone doesn't mean "my cat" to actually learn the distinction.
 - Keep `no_cat/` photos genuinely representative of false triggers (wind,
   shadows, other animals) rather than just empty daylight shots.

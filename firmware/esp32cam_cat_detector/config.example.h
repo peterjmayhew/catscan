@@ -47,4 +47,12 @@
 #define FLASH_WARMUP_MS 50
 #define FLASH_WARMUP_DARK_MS 200
 
+// A single frame is an unreliable basis for "is this my cat or the
+// neighbour's" - a bad angle or motion blur on one frame can flip the
+// verdict. Each trigger instead captures a short burst of frames; the
+// server combines them into one majority-vote result (see BURST_SIZE /
+// BURST_WINDOW_SECONDS in server/app.py, which should match these).
+#define BURST_FRAME_COUNT 3
+#define BURST_FRAME_DELAY_MS 400
+
 #endif

@@ -147,21 +147,32 @@ bool sendFrameToServer(camera_fb_t *fb) {
   return httpCode > 0;
 }
 
+// Captures BURST_FRAME_COUNT frames instead of one. A single frame is an
+// unreliable basis for telling cats apart (motion blur, a bad angle, an
+// ear in the way); the server combines the burst into one majority-vote
+// result instead of trusting any single frame.
 void captureAndSend() {
   bool dark = isDark();
-  digitalWrite(FLASH_PIN, HIGH); // fill light helps the classifier see
-  delay(dark ? FLASH_WARMUP_DARK_MS : FLASH_WARMUP_MS);
 
-  camera_fb_t *fb = esp_camera_fb_get();
-  digitalWrite(FLASH_PIN, LOW);
+  for (int i = 0; i < BURST_FRAME_COUNT; i++) {
+    digitalWrite(FLASH_PIN, HIGH); // fill light helps the classifier see
+    delay(dark ? FLASH_WARMUP_DARK_MS : FLASH_WARMUP_MS);
 
-  if (!fb) {
-    Serial.println("Camera capture failed");
-    return;
+    camera_fb_t *fb = esp_camera_fb_get();
+    digitalWrite(FLASH_PIN, LOW);
+
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      continue;
+    }
+
+    sendFrameToServer(fb);
+    esp_camera_fb_return(fb);
+
+    if (i < BURST_FRAME_COUNT - 1) {
+      delay(BURST_FRAME_DELAY_MS);
+    }
   }
-
-  sendFrameToServer(fb);
-  esp_camera_fb_return(fb);
 }
 
 void setup() {

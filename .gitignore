@@ -12,9 +12,11 @@ venv/
 server/models/*.h5
 server/models/*.tflite
 captures/
-data/my_tabby/
+data/my_cat/
 data/other_cat/
 data/no_cat/
+data/reference_photos/*.jpg
+data/reference_photos/*.jpeg
 
 # OS cruft
 .DS_Store

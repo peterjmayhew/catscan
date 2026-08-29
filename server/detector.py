@@ -1,25 +1,39 @@
-"""Cat detection + tabby-vs-other classification.
+"""Cat detection + identity classification (your cat vs. a neighbour's).
 
-Two modes, picked automatically:
+Three backends, picked automatically in this order of preference (each
+falls back to the next if it isn't set up):
 
-- "model" mode: if server/models/cat_classifier.h5 exists, load it and use
-  it for everything (cat/no-cat and which-cat). This is the accurate path,
-  but needs you to have trained it first (see train_classifier.py).
-- "heuristic" mode: the fallback used until you've trained a model. Finds a
-  cat-like face with OpenCV's built-in Haar cascades, then scores the coat
-  for "stripy-ness" using edge/texture density. Tabby coats produce much
-  higher local texture variance than solid-coloured coats, so this is a
-  reasonable - if imperfect - starting point.
+- "cloud": asks Claude's vision model to compare the capture against a
+  handful of reference photos of your own cat(s) in data/reference_photos/.
+  No training required, and unlike the other two modes it judges actual
+  identity (coat colour/pattern + build), not just "is it stripy" - so it's
+  the only mode that reliably works if the neighbour's cat is *also* a
+  tabby. Requires ANTHROPIC_API_KEY. See README "Reliable identification".
+- "model": if server/models/cat_classifier.h5 exists, a MobileNetV2
+  classifier fine-tuned on your own labelled photos (train_classifier.py).
+  Accurate once trained, including on two similar-looking tabbies, but
+  needs you to collect a real dataset first.
+- "heuristic": the zero-setup fallback. Finds a cat-like face with OpenCV's
+  built-in Haar cascades, then scores the coat for "stripy-ness" using
+  edge/texture density. This only distinguishes tabby vs. non-tabby coat
+  *pattern* - it cannot tell two tabbies apart, so if your neighbour's cat
+  is also a tabby, this mode will not reliably solve your actual problem.
+  Use it to get something running today, then move to "model" or "cloud".
+
+Set DETECTION_BACKEND=cloud|model|heuristic to force one; default "auto"
+uses the best one that's actually configured.
 """
 
+import logging
 import os
 
 import cv2
 import numpy as np
 
-LABELS = ["no_cat", "my_tabby", "other_cat"]
+LABELS = ["no_cat", "my_cat", "other_cat"]
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
 MODEL_PATH = os.path.join(MODEL_DIR, "cat_classifier.h5")
+BACKEND = os.environ.get("DETECTION_BACKEND", "auto")
 
 # Heuristic thresholds (see README "Training your own classifier" - the
 # heuristic is a starting point, not a substitute for the trained model).
@@ -38,7 +52,28 @@ class CatDetector:
         self._face_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalcatface_extended.xml"
         )
-        self._model = self._try_load_model()
+        self._cloud = None
+        self._model = None
+
+        if BACKEND in ("auto", "cloud"):
+            self._cloud = self._try_init_cloud()
+        if self._cloud is None and BACKEND in ("auto", "model"):
+            self._model = self._try_load_model()
+
+    def _try_init_cloud(self):
+        try:
+            # Imported lazily so the server doesn't need the anthropic
+            # package or an API key unless you actually opt into cloud mode.
+            from cloud_classifier import CloudClassifier
+
+            return CloudClassifier()
+        except Exception as exc:  # not installed, not configured, or misconfigured
+            if BACKEND == "cloud":
+                raise
+            logging.getLogger(__name__).info(
+                "Cloud AI backend not available, falling back: %s", exc
+            )
+            return None
 
     def _try_load_model(self):
         if not os.path.exists(MODEL_PATH):
@@ -51,6 +86,8 @@ class CatDetector:
 
     @property
     def mode(self):
+        if self._cloud is not None:
+            return "cloud"
         return "model" if self._model is not None else "heuristic"
 
     def _mean_brightness(self, image_bgr):
@@ -84,14 +121,37 @@ class CatDetector:
             gray = self._enhance_low_light(gray)
         return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
+    def _crop_subject(self, image_bgr, low_light):
+        """Crops to the detected cat, with padding, so the CNN/cloud model
+        judges the animal itself rather than background clutter. Falls back
+        to the full frame if the cascade doesn't find anything (it often
+        misses side-on poses) - the classifier still gets a shot at it."""
+        face = self.find_cat_face(image_bgr, enhance=low_light)
+        if face is None:
+            return image_bgr
+
+        x, y, w, h = face
+        pad_x, pad_y = int(w * 0.3), int(h * 0.3)
+        img_h, img_w = image_bgr.shape[:2]
+        x0, y0 = max(x - pad_x, 0), max(y - pad_y, 0)
+        x1, y1 = min(x + w + pad_x, img_w), min(y + h + pad_y, img_h)
+        return image_bgr[y0:y1, x0:x1]
+
     def classify(self, image_bgr):
         low_light = self.is_low_light(image_bgr)
-        if self._model is not None:
-            result = self._classify_with_model(image_bgr)
+        if self._cloud is not None:
+            subject = self._crop_subject(image_bgr, low_light)
+            result = self._classify_with_cloud(subject)
+        elif self._model is not None:
+            subject = self._crop_subject(image_bgr, low_light)
+            result = self._classify_with_model(subject)
         else:
             result = self._classify_heuristic(image_bgr, low_light)
         result["low_light"] = low_light
         return result
+
+    def _classify_with_cloud(self, image_bgr):
+        return self._cloud.classify(image_bgr)
 
     def _classify_with_model(self, image_bgr):
         resized = cv2.resize(image_bgr, (224, 224))
@@ -133,7 +193,7 @@ class CatDetector:
 
         return {
             "cat_detected": True,
-            "label": "my_tabby" if is_tabby else "other_cat",
+            "label": "my_cat" if is_tabby else "other_cat",
             "confidence": round(confidence, 3),
             "mode": "heuristic",
             "stripy_score": round(score, 2),
