@@ -8,3 +8,7 @@ tensorflow==2.17.0
 # left unpinned to a specific patch since the SDK moves quickly; run
 # `pip install -U anthropic` if you hit an incompatibility.
 anthropic>=0.40.0
+# Only needed for the optional local YOLOv8 backend (DETECTION_BACKEND=yolo).
+# Pulls in torch automatically; installs CPU-only by default - see README
+# "YOLOv8 backend" for GPU setup.
+ultralytics>=8.2.0

@@ -14,27 +14,33 @@ trained model or an AI vision backend - a simple rule-of-thumb like "is it
 stripy" cannot do it**, and it's worth being upfront about why before you
 build on top of this.
 
-Three backends are included, in increasing order of reliability:
+Four backends are included, in increasing order of reliability:
 
 1. **Heuristic** (default, zero setup): scores the coat for "stripy-ness".
    This only tells tabby-patterned coats from plain ones. **If your
    neighbour's cat is also a tabby, this mode cannot distinguish them at
    all** - it isn't actually looking at identity, just pattern. Good for
    getting something running on day one, not for the real problem.
-2. **Trained model** (`server/train_classifier.py`): a MobileNetV2 CNN
-   fine-tuned on your own labelled photos. This looks at the whole
-   coat/face, not just "stripy or not", so it *can* separate two similar
-   tabbies - but only as well as the dataset you train it on. Needs
-   ~100+ photos per cat/class, ideally including several photos of the
-   neighbour's cat specifically (not just "other cats in general").
-3. **Cloud AI** (`server/cloud_classifier.py`, new): sends the capture plus
-   a handful of reference photos of your cat(s) to Claude's vision model
-   and asks it to judge identity directly - no training step, and it
-   reasons about colour/markings/build the way a person would, so it
-   handles "two similar tabbies" without needing hundreds of examples.
-   Needs only `ANTHROPIC_API_KEY` and 3-6 reference photos. Trade-off: a
-   few seconds of latency and a small per-image API cost, so it's for the
-   already-throttled capture rate here, not a live video feed.
+2. **Trained model - TensorFlow or YOLOv8** (`server/train_classifier.py`
+   or `server/train_classifier_yolo.py`): a CNN fine-tuned on your own
+   labelled photos (MobileNetV2 or YOLOv8-cls respectively - same job,
+   different framework, pick whichever you'd rather run locally). This
+   looks at the whole coat/face, not just "stripy or not", so it *can*
+   separate two similar tabbies - but only as well as the dataset you
+   train it on. Needs ~100+ photos per cat/class, ideally including
+   several photos of the neighbour's cat specifically (not just "other
+   cats in general"). The YOLOv8 path also swaps in a proper pretrained
+   object detector for finding the cat in-frame, which is more robust than
+   the Haar cascade the other local backends use.
+3. **Cloud AI** (`server/cloud_classifier.py`): sends the capture plus a
+   handful of reference photos of your cat(s) to Claude's vision model and
+   asks it to judge identity directly - no training step, and it reasons
+   about colour/markings/build the way a person would, so it handles "two
+   similar tabbies" without needing hundreds of examples. Needs only
+   `ANTHROPIC_API_KEY` and 3-6 reference photos. Trade-off: a few seconds
+   of latency and a small per-image API cost, so it's for the
+   already-throttled capture rate here, not a live video feed, and it
+   needs internet access (the YOLOv8 path is the local-only alternative).
 
 See "Reliable identification" further down for how each is enabled, and
 "Multi-frame consensus" for how single noisy frames get smoothed out
@@ -132,9 +138,11 @@ every frame as its own verdict.
 firmware/esp32cam_cat_detector/esp32cam_cat_detector.ino  - ESP32-CAM sketch
 firmware/esp32cam_cat_detector/config.example.h           - Wi-Fi/server settings template
 server/app.py                - Flask server: receives frames, aggregates bursts, dispatches results
-server/detector.py           - Backend selection (cloud/model/heuristic) + classification logic
+server/detector.py           - Backend selection (cloud/model/yolo/heuristic) + classification logic
 server/cloud_classifier.py   - Cloud AI backend: identity matching via Claude's vision model
-server/train_classifier.py   - Fine-tunes a MobileNetV2 classifier on your photos
+server/train_classifier.py   - Fine-tunes a MobileNetV2 (TensorFlow) classifier on your photos
+server/yolo_detector.py      - Local YOLOv8 backend: cat localization + optional identity classifier
+server/train_classifier_yolo.py - Fine-tunes a YOLOv8 classifier on your photos (local, no TensorFlow)
 server/wordpress_client.py   - Uploads each detection to the WordPress plugin
 server/requirements.txt      - Python dependencies
 data/README.md               - How to collect a training set
@@ -219,9 +227,10 @@ become your training set for `train_classifier.py`.
 | Variable | Default | Purpose |
 |---|---|---|
 | `PORT` | `5000` | Server port |
-| `DETECTION_BACKEND` | `auto` | Force `cloud`, `model`, or `heuristic`; `auto` picks the best one that's configured |
+| `DETECTION_BACKEND` | `auto` | Force `cloud`, `model`, `yolo`, or `heuristic`; `auto` picks the best one that's configured |
 | `ANTHROPIC_API_KEY` | unset | Enables the cloud AI backend |
 | `ANTHROPIC_MODEL` | `claude-sonnet-5` | Model used for cloud identification |
+| `YOLO_DETECTOR_MODEL` | `yolov8n.pt` | Pretrained YOLOv8 checkpoint used to locate the cat in-frame |
 | `BURST_SIZE` | `3` | Frames per burst before closing it out early - match `BURST_FRAME_COUNT` in `config.h` |
 | `BURST_WINDOW_SECONDS` | `10` | Max time to wait for a full burst before closing it out anyway |
 | `WORDPRESS_URL` | unset | Enables uploading detections to your WordPress site |
@@ -268,6 +277,42 @@ This adds a couple of seconds of latency and a small per-image cost to
 each classification - fine given the existing capture cooldown, not meant
 for high-frequency triggering. Set `DETECTION_BACKEND=model` or
 `DETECTION_BACKEND=heuristic` to opt out and force a different backend.
+
+## YOLOv8 backend (local PC, optional)
+
+A local alternative to both the TensorFlow model and the cloud backend -
+runs entirely on your own PC (CPU or GPU), no internet access or API cost
+required once set up.
+
+1. `pip install ultralytics` (already in `server/requirements.txt`). The
+   first run downloads the small pretrained detector checkpoint
+   (`yolov8n.pt`, ~6MB) automatically.
+2. Even with no training at all, setting `DETECTION_BACKEND=yolo` gives you
+   a proper object detector finding the cat in-frame (via YOLOv8's
+   pretrained COCO "cat" class) - more robust than the Haar cascade the
+   other local backends use, especially for side-on poses. Without a
+   trained classifier, though, it can only say "a cat is here", not whose -
+   it reports every detection as `other_cat` with `"identity_unavailable":
+   true` until you train one.
+3. To get actual identity matching, train a classifier the same way as the
+   TensorFlow path, just with a different script:
+   ```bash
+   cd server
+   python3 train_classifier_yolo.py
+   ```
+   This uses the same `data/my_cat`, `data/other_cat`, `data/no_cat`
+   folders as `train_classifier.py` (see `data/README.md`), and writes
+   `server/models/cat_classifier_yolo.pt`.
+4. Restart `app.py`. In `auto` mode, this backend is only picked once
+   `cat_classifier_yolo.pt` exists (so installing `ultralytics` alone
+   doesn't silently change your setup); set `DETECTION_BACKEND=yolo`
+   explicitly to force it, including in "detection-only" mode before
+   you've trained a classifier.
+
+Runs on CPU by default; for GPU acceleration, install a CUDA-enabled
+`torch` build for your hardware before `pip install ultralytics` (see
+[pytorch.org](https://pytorch.org/get-started/locally/)) - the pip-default
+install is CPU-only.
 
 ## Multi-frame consensus (burst capture)
 

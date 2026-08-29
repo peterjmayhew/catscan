@@ -1,27 +1,34 @@
 """Cat detection + identity classification (your cat vs. a neighbour's).
 
-Three backends, picked automatically in this order of preference (each
+Four backends, picked automatically in this order of preference (each
 falls back to the next if it isn't set up):
 
 - "cloud": asks Claude's vision model to compare the capture against a
   handful of reference photos of your own cat(s) in data/reference_photos/.
-  No training required, and unlike the other two modes it judges actual
+  No training required, and unlike the local modes it judges actual
   identity (coat colour/pattern + build), not just "is it stripy" - so it's
-  the only mode that reliably works if the neighbour's cat is *also* a
-  tabby. Requires ANTHROPIC_API_KEY. See README "Reliable identification".
+  the only mode that reliably works out of the box if the neighbour's cat
+  is *also* a tabby. Requires ANTHROPIC_API_KEY. See README "Reliable
+  identification".
 - "model": if server/models/cat_classifier.h5 exists, a MobileNetV2
   classifier fine-tuned on your own labelled photos (train_classifier.py).
   Accurate once trained, including on two similar-looking tabbies, but
   needs you to collect a real dataset first.
+- "yolo": if server/models/cat_classifier_yolo.pt exists, a YOLOv8
+  classifier fine-tuned the same way (train_classifier_yolo.py) - same job
+  as "model", different framework, entirely local (no TensorFlow needed).
+  Also uses a pretrained YOLOv8 *detector* for locating the cat in-frame,
+  which is more robust than the Haar cascade the other backends rely on.
 - "heuristic": the zero-setup fallback. Finds a cat-like face with OpenCV's
   built-in Haar cascades, then scores the coat for "stripy-ness" using
   edge/texture density. This only distinguishes tabby vs. non-tabby coat
   *pattern* - it cannot tell two tabbies apart, so if your neighbour's cat
   is also a tabby, this mode will not reliably solve your actual problem.
-  Use it to get something running today, then move to "model" or "cloud".
+  Use it to get something running today, then move to "model"/"yolo" or
+  "cloud".
 
-Set DETECTION_BACKEND=cloud|model|heuristic to force one; default "auto"
-uses the best one that's actually configured.
+Set DETECTION_BACKEND=cloud|model|yolo|heuristic to force one; default
+"auto" uses the best one that's actually configured.
 """
 
 import logging
@@ -54,11 +61,14 @@ class CatDetector:
         )
         self._cloud = None
         self._model = None
+        self._yolo = None
 
         if BACKEND in ("auto", "cloud"):
             self._cloud = self._try_init_cloud()
         if self._cloud is None and BACKEND in ("auto", "model"):
             self._model = self._try_load_model()
+        if self._cloud is None and self._model is None and BACKEND in ("auto", "yolo"):
+            self._yolo = self._try_init_yolo()
 
     def _try_init_cloud(self):
         try:
@@ -84,11 +94,33 @@ class CatDetector:
 
         return tf.keras.models.load_model(MODEL_PATH)
 
+    def _try_init_yolo(self):
+        try:
+            from yolo_detector import CLASSIFIER_PATH, YoloDetector
+
+            if BACKEND == "auto" and not os.path.exists(CLASSIFIER_PATH):
+                # Don't let auto-mode pick a YOLO backend that can only ever
+                # say "other_cat" for every detection - that's worse than
+                # the heuristic's actual (if weak) attempt at a guess.
+                # Explicitly requesting DETECTION_BACKEND=yolo still works
+                # without a trained classifier, for detection-only use.
+                return None
+            return YoloDetector()
+        except Exception as exc:  # not installed, or misconfigured
+            if BACKEND == "yolo":
+                raise
+            logging.getLogger(__name__).info(
+                "YOLOv8 backend not available, falling back: %s", exc
+            )
+            return None
+
     @property
     def mode(self):
         if self._cloud is not None:
             return "cloud"
-        return "model" if self._model is not None else "heuristic"
+        if self._model is not None:
+            return "model"
+        return "yolo" if self._yolo is not None else "heuristic"
 
     def _mean_brightness(self, image_bgr):
         gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
@@ -145,6 +177,10 @@ class CatDetector:
         elif self._model is not None:
             subject = self._crop_subject(image_bgr, low_light)
             result = self._classify_with_model(subject)
+        elif self._yolo is not None:
+            # YOLO does its own subject localization internally (its own
+            # detector model, not the Haar cascade), so it gets the full frame.
+            result = self._yolo.classify(image_bgr)
         else:
             result = self._classify_heuristic(image_bgr, low_light)
         result["low_light"] = low_light

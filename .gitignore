@@ -11,6 +11,10 @@ venv/
 # your own copies out of git rather than bloating the repo)
 server/models/*.h5
 server/models/*.tflite
+server/models/*.pt
+server/runs/
+server/yolo_dataset/
+*.pt
 captures/
 data/my_cat/
 data/other_cat/
