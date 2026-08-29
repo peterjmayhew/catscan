@@ -123,6 +123,8 @@ Splitting this into two separate problems makes it much less daunting:
              each JPEG            2. label: no_cat / my_cat / other_cat
                                  Burst of frames -> majority-vote consensus
                                    -> save image, log to WordPress,
+                                      fire deterrent if "other_cat" (direct
+                                      LAN call, not via WordPress),
                                       optionally call a notification webhook
 ```
 
@@ -144,6 +146,7 @@ server/train_classifier.py   - Fine-tunes a MobileNetV2 (TensorFlow) classifier 
 server/yolo_detector.py      - Local YOLOv8 backend: cat localization + optional identity classifier
 server/train_classifier_yolo.py - Fine-tunes a YOLOv8 classifier on your photos (local, no TensorFlow)
 server/wordpress_client.py   - Uploads each detection to the WordPress plugin
+server/remote_control.py     - Bridges the ESP32 (LAN) and WordPress (internet) for remote control
 server/requirements.txt      - Python dependencies
 data/README.md               - How to collect a training set
 data/reference_photos/       - Reference photos for the cloud AI backend
@@ -174,12 +177,19 @@ wordpress-plugin/catscan-detections/  - WordPress plugin (see "WordPress integra
    dark" above). Without one, `isDark()` will just read whatever GPIO 33
    floats to — fine to leave disconnected if you don't need this, but wire
    it up if you want the night-time flash behaviour to actually work.
-5. Power the board from 5V (camera + Wi-Fi draws more current than USB-only
+5. *(Optional)* A deterrent output - see "Deterring the neighbour's cat"
+   below for hardware options - wired to **GPIO 12** through whatever
+   driver circuit your chosen device needs (a transistor/MOSFET for a
+   buzzer, a relay module for something mains- or 12V-powered). GPIO 12 is
+   a boot-strapping pin: wire the driver so it idles LOW (a pull-down
+   resistor on most driver boards already does this), or the device may
+   fail to boot reliably.
+6. Power the board from 5V (camera + Wi-Fi draws more current than USB-only
    power on some boards can reliably supply — use the kit's dedicated 5V
    supply/programmer, not just a phone charger through a thin cable).
 
 Board pinouts vary slightly between ESP32-CAM clones/revisions — double
-check GPIO 14/15/33 are actually free on yours (some are shared with the
+check GPIO 12/14/15/33 are actually free on yours (some are shared with the
 microSD slot) before wiring, and adjust the `#define`s in `config.h` if not.
 
 ## Firmware setup
@@ -234,12 +244,34 @@ it) and exposes:
   This is per-frame, not the burst consensus - see "Multi-frame consensus"
   below for what actually gets logged/uploaded.
 - `GET /health` — liveness check; also reports which backend is active
-  (`"mode": "cloud" | "model" | "heuristic"`) and whether WordPress upload
-  is configured.
+  (`"mode": "cloud" | "model" | "yolo" | "heuristic"`) and whether
+  WordPress/ESP32 control are configured.
 
 Every image the server receives is saved under `captures/<label>/` with a
 timestamp, both so you can review what it's seeing and so those images
-become your training set for `train_classifier.py`.
+become your training set for `train_classifier.py` - old ones are cleaned
+up automatically (see `CAPTURES_RETENTION_DAYS` below).
+
+**Production deployment:** `python3 app.py` uses Flask's built-in
+development server, which is fine for "runs reliably on my home network"
+but isn't meant for real production traffic. For anything beyond personal
+use on a trusted LAN, run it behind a real WSGI server instead:
+```bash
+pip install gunicorn
+gunicorn --bind 0.0.0.0:5000 --workers 1 --threads 4 --timeout 60 app:app
+```
+**Keep `--workers 1`** - the burst aggregation buffer and the remote
+control loop both live in a single process's memory. Multiple worker
+*processes* would each keep their own separate burst state and each run
+their own remote-control loop, silently breaking burst aggregation (frames
+from one trigger could land on different workers and never be combined)
+and duplicating WordPress heartbeats/command polling. `--threads 4` gives
+you real concurrency for slow outbound calls (WordPress/cloud AI) without
+that problem, same as Flask's own `threaded=True` used when running
+directly. (Use `waitress` instead of `gunicorn` on Windows, since gunicorn
+is Unix-only - same single-process reasoning applies.) The server already
+sets `MAX_CONTENT_LENGTH` to reject oversized uploads and validates
+`DETECTION_BACKEND` at startup rather than silently misbehaving on a typo.
 
 ### Configuration (environment variables)
 
@@ -256,6 +288,11 @@ become your training set for `train_classifier.py`.
 | `WORDPRESS_API_KEY` | unset | From Settings → CatScan in WordPress admin |
 | `NOTIFY_WEBHOOK_URL` | unset | Generic webhook (ntfy.sh, Home Assistant, Discord, etc.), called on `other_cat` |
 | `DEVICE_API_KEY` | unset | If set, `/detect` requires a matching `X-Device-Key` header (set the same value as `DEVICE_API_KEY` in the firmware's `config.h`) |
+| `CAPTURES_RETENTION_DAYS` | `30` | Auto-deletes local files under `captures/` older than this; `0` keeps everything forever |
+| `LOG_LEVEL` | `INFO` | Python logging level (`DEBUG`, `WARNING`, etc.) |
+| `ESP32_CONTROL_URL` | unset | e.g. `http://192.168.1.60` - enables remote control/monitoring and the automatic deterrent (see "Remote control & monitoring" and "Deterring the neighbour's cat") |
+| `ESP32_CONTROL_KEY` | unset | Matches `CONTROL_API_KEY` in the firmware's `config.h`, if you set one |
+| `HEARTBEAT_INTERVAL_SECONDS` | `20` | How often the server pushes device status to WordPress and polls it for queued commands |
 
 ## Training your own classifier
 
@@ -404,6 +441,113 @@ The REST endpoint is also rate-limited (30 requests/minute by default) as
 abuse protection in case the API key ever leaks - far more than a single
 camera's normal traffic needs.
 
+## Remote control & monitoring
+
+You can check the camera's status and send it commands from Settings →
+CatScan → Device in WordPress - reboot it, trigger a capture on demand,
+test the deterrent, or toggle auto-deterrent - without physically going
+near it.
+
+**Be clear on what this actually is, architecturally.** Your WordPress
+site is on the public internet; your ESP32 is on your home LAN with (most
+likely) no port forwarding. WordPress cannot reach into your LAN directly
+- there's no way around that without exposing the device to the internet,
+which this project deliberately doesn't do. Instead:
+
+```
+ESP32 (LAN, port 80)  ◄──── server/remote_control.py ────►  WordPress (internet)
+  /status, /command         polls both directions              Device page
+                             every HEARTBEAT_INTERVAL_SECONDS   (queue/display)
+```
+
+Every `HEARTBEAT_INTERVAL_SECONDS` (default 20s), the server fetches the
+ESP32's `/status` and pushes it to WordPress, then checks WordPress for a
+command queued from the Device page and forwards it to the ESP32. This
+means:
+
+- Status on the Device page is **up to ~20 seconds stale**, not live video
+  - there's no continuous stream here. Deliberately: proxying continuous
+    video through a hosted WordPress site would risk blowing through a
+    personal host's bandwidth/CPU limits for something a LAN-only
+    connection handles trivially. "Capture now" gets you an on-demand
+    photo through the existing detection pipeline instead, which is a
+    much cheaper way to check in on what the camera sees.
+- A queued command takes **up to ~20 seconds** to actually reach the
+  device, not instant.
+- If either the server or WordPress is down, this whole feature is down -
+  but the core detection pipeline (ESP32 → server) keeps working
+  regardless, since it doesn't depend on this bridge at all.
+
+**Setup:**
+
+1. Set `CONTROL_API_KEY` in the firmware's `config.h` (recommended - the
+   local control server has no auth if you leave it blank).
+2. On the server, set `ESP32_CONTROL_URL` (e.g. `http://192.168.1.60`, the
+   ESP32's LAN IP - give it a static DHCP lease so this doesn't change) and
+   `ESP32_CONTROL_KEY` to match.
+3. With `WORDPRESS_URL`/`WORDPRESS_API_KEY` already set (see "WordPress
+   integration"), restart `app.py` - Settings → CatScan → Device should
+   show "Online" within `HEARTBEAT_INTERVAL_SECONDS`.
+
+Available commands (from the Device page's buttons): reboot the device,
+capture now, test the deterrent (fires regardless of the auto-deterrent
+toggle, for verifying wiring), and enable/disable auto-deterrent (this
+setting is remembered in the ESP32's flash, surviving reboots including
+the daily scheduled one).
+
+## Deterring the neighbour's cat
+
+When a burst resolves to `other_cat`, the server calls the ESP32's
+`/command` endpoint **directly over the LAN** - not via WordPress - to
+fire a deterrent output immediately. This is a deliberate design choice:
+a cat already at your cat flap needs a response in well under a second,
+and a round trip through a hosted website cannot deliver that.
+
+**What "deterrent" means here, and what it doesn't.** This project drives
+a generic output pin (`DETERRENT_PIN`, GPIO12) for `DETERRENT_ACTIVE_MS`
+(default 3 seconds) - what you wire to it is up to you:
+
+- A **buzzer/piezo speaker** (via a transistor if it draws more current
+  than a GPIO can supply) - a loud, harmless noise most cats dislike.
+- An **ultrasonic pest-repeller module** - inaudible to you, unpleasant to
+  many cats, sold cheaply for exactly this kind of use.
+- A **relay** switching something else entirely (a light, a sprinkler
+  valve) - same interface, your choice of consequence.
+
+**What this deliberately does *not* do: physically lock the cat flap.**
+A camera-triggered mechanical lock is a real animal-safety risk if it
+misfires - a false "other_cat" classification, a network hiccup at the
+wrong moment, or a bug could trap your own cat outside (or the
+neighbour's cat half-through the flap). A scare deterrent has no failure
+mode worse than "didn't work this time." If you want guaranteed physical
+exclusion rather than a deterrent, the robust, purpose-built solution is a
+**commercial microchip-locking cat flap** (e.g. SureFlap and similar) -
+these read your cat's existing microchip or a collar tag and mechanically
+admit only your cat, with none of the false-positive risk a vision model
+carries. The two approaches aren't mutually exclusive: many people use a
+locking flap for guaranteed exclusion *and* this project for the
+monitoring/logging/notifications a locking flap doesn't provide on its
+own.
+
+**Setup:**
+
+1. Wire your chosen deterrent device to `DETERRENT_PIN` (GPIO12) via
+   whatever driver it needs - see "Hardware setup" above for the
+   boot-strapping-pin caveat.
+2. Set `DETERRENT_ACTIVE_MS`/`DETERRENT_COOLDOWN_MS` in `config.h` to
+   suit your device (a relay driving something slower to react might need
+   longer than a buzzer).
+3. Set `ESP32_CONTROL_URL` on the server (see "Remote control" above) -
+   without it, `other_cat` detections are still logged/notified, but the
+   server has no way to reach the ESP32 to fire the deterrent.
+4. Test it without waiting for a real detection: Settings → CatScan →
+   Device → "Test deterrent".
+
+Only tested for logic correctness here (LAN call, cooldown, non-blocking
+auto-off) - the actual physical effectiveness of any deterrent device
+against your specific neighbour's cat is something only testing in place
+can tell you.
+
 ## Notifications (optional)
 
 Set the `NOTIFY_WEBHOOK_URL` environment variable before starting `app.py`
@@ -415,6 +559,7 @@ Left unset, the server just logs to the console.
 
 - Fully on-device TinyML on an ESP32-S3 board (no server needed) via Edge
   Impulse, once you have a solid labelled dataset from this project.
-- A physical deterrent (sprinkler/ultrasonic) triggered only on
-  `other_cat`.
 - Telegram/Pushover push notifications instead of a generic webhook.
+- Persisting burst-aggregation state outside process memory (e.g. Redis),
+  which would be needed if this ever grew to multiple cameras/servers -
+  not needed for the single-device setup this project assumes.

@@ -40,7 +40,14 @@ import numpy as np
 LABELS = ["no_cat", "my_cat", "other_cat"]
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
 MODEL_PATH = os.path.join(MODEL_DIR, "cat_classifier.h5")
+
+_VALID_BACKENDS = ("auto", "cloud", "model", "yolo", "heuristic")
 BACKEND = os.environ.get("DETECTION_BACKEND", "auto")
+if BACKEND not in _VALID_BACKENDS:
+    raise ValueError(
+        f"DETECTION_BACKEND={BACKEND!r} is not one of {_VALID_BACKENDS} - "
+        "fix the environment variable rather than silently falling back."
+    )
 
 # Heuristic thresholds (see README "Training your own classifier" - the
 # heuristic is a starting point, not a substitute for the trained model).
@@ -167,7 +174,11 @@ class CatDetector:
         img_h, img_w = image_bgr.shape[:2]
         x0, y0 = max(x - pad_x, 0), max(y - pad_y, 0)
         x1, y1 = min(x + w + pad_x, img_w), min(y + h + pad_y, img_h)
-        return image_bgr[y0:y1, x0:x1]
+        crop = image_bgr[y0:y1, x0:x1]
+        # A cascade box clipped entirely outside the frame would otherwise
+        # hand an empty array to cv2.resize() downstream and crash the
+        # request - fall back to the full frame instead.
+        return crop if crop.size > 0 else image_bgr
 
     def classify(self, image_bgr):
         low_light = self.is_low_light(image_bgr)

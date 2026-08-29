@@ -118,8 +118,68 @@ function catscan_register_routes() {
         'callback' => 'catscan_handle_detection_upload',
         'permission_callback' => 'catscan_check_api_key',
     ]);
+
+    // Remote control bridge: the server pushes a status heartbeat here and
+    // polls pending-command for anything queued from the Device panel
+    // below. Same auth (and rate limit) as /detections.
+    register_rest_route('catscan/v1', '/heartbeat', [
+        'methods' => 'POST',
+        'callback' => 'catscan_handle_heartbeat',
+        'permission_callback' => 'catscan_check_api_key',
+    ]);
+    register_rest_route('catscan/v1', '/pending-command', [
+        'methods' => 'GET',
+        'callback' => 'catscan_handle_pending_command',
+        'permission_callback' => 'catscan_check_api_key',
+    ]);
 }
 add_action('rest_api_init', 'catscan_register_routes');
+
+/**
+ * Stores a device status snapshot (uptime, Wi-Fi signal, etc.) for display
+ * on Settings -> CatScan -> Device. Only known scalar fields are kept -
+ * arbitrary nested structures from the network are never stored as-is.
+ */
+function catscan_handle_heartbeat(WP_REST_Request $request) {
+    $status = $request->get_json_params();
+    if (!is_array($status)) {
+        $status = [];
+    }
+
+    $safe_status = [];
+    $known_keys = [
+        'reachable', 'uptime_s', 'free_heap', 'wifi_rssi',
+        'dark', 'deterrent_enabled', 'seconds_since_last_capture',
+    ];
+    foreach ($known_keys as $key) {
+        if (isset($status[$key]) && is_scalar($status[$key])) {
+            $safe_status[$key] = $status[$key];
+        }
+    }
+
+    // autoload=false: this changes every ~20 seconds and has no business
+    // being loaded on every single page request on the site.
+    update_option('catscan_device_status', $safe_status, false);
+    update_option('catscan_last_heartbeat', time(), false);
+
+    return new WP_REST_Response(['success' => true], 200);
+}
+
+/**
+ * Returns (and clears) a command queued from the Device panel. The GET
+ * itself is the dequeue - there's no separate "acknowledge" step, so a
+ * command is considered delivered the moment the server fetches it, even
+ * if forwarding it to the ESP32 then fails (the server logs that
+ * separately; re-queuing on failure isn't implemented, so re-click the
+ * button if a command doesn't seem to have taken effect).
+ */
+function catscan_handle_pending_command(WP_REST_Request $request) {
+    $command = get_option('catscan_pending_command', '');
+    if ($command) {
+        delete_option('catscan_pending_command');
+    }
+    return new WP_REST_Response(['command' => $command ?: null], 200);
+}
 
 function catscan_check_api_key(WP_REST_Request $request) {
     $provided = $request->get_header('x-api-key');
@@ -422,6 +482,18 @@ function catscan_render_settings_page() {
         echo '<div class="notice notice-success"><p>' . esc_html__('Settings saved.', 'catscan-detections') . '</p></div>';
     }
 
+    if (
+        isset($_POST['catscan_queue_command'])
+        && check_admin_referer('catscan_queue_command_action', 'catscan_command_nonce')
+    ) {
+        $allowed_commands = ['reboot', 'capture', 'deter_test', 'deterrent_on', 'deterrent_off'];
+        $command = sanitize_text_field(wp_unslash($_POST['catscan_queue_command']));
+        if (in_array($command, $allowed_commands, true)) {
+            update_option('catscan_pending_command', $command, false);
+            echo '<div class="notice notice-success"><p>' . esc_html__('Command queued - the server picks it up within about 20 seconds.', 'catscan-detections') . '</p></div>';
+        }
+    }
+
     $api_key = get_option(CATSCAN_OPTION_API_KEY);
     $endpoint = esc_url(rest_url('catscan/v1/detections'));
     $retention_days = (int) get_option(CATSCAN_OPTION_RETENTION_DAYS, 90);
@@ -473,6 +545,61 @@ function catscan_render_settings_page() {
                 </tr>
             </table>
             <?php submit_button(__('Save settings', 'catscan-detections'), 'primary', 'catscan_save_settings'); ?>
+        </form>
+        <hr>
+        <h2><?php esc_html_e('Device', 'catscan-detections'); ?></h2>
+        <?php
+        $last_heartbeat = (int) get_option('catscan_last_heartbeat', 0);
+        $device_status = get_option('catscan_device_status', []);
+        if (!is_array($device_status)) {
+            $device_status = [];
+        }
+        // 90s tolerates a few missed beats at the server's default ~20s
+        // heartbeat interval without flapping "offline" on one dropped one.
+        $bridge_online = $last_heartbeat > 0 && (time() - $last_heartbeat) < 90;
+        $camera_reachable = $bridge_online && isset($device_status['uptime_s']);
+        ?>
+        <p>
+            <?php if ($last_heartbeat === 0) : ?>
+                <?php esc_html_e('No status received yet - check WORDPRESS_URL/WORDPRESS_API_KEY on your server.', 'catscan-detections'); ?>
+            <?php elseif (!$bridge_online) : ?>
+                <strong style="color:#d63638;"><?php esc_html_e('Bridge server offline', 'catscan-detections'); ?></strong>
+                &mdash; <?php printf(esc_html__('last checked in %s ago. Is server/app.py still running?', 'catscan-detections'), esc_html(human_time_diff($last_heartbeat, time()))); ?>
+            <?php elseif (!$camera_reachable) : ?>
+                <strong style="color:#dba617;"><?php esc_html_e('Server online, camera unreachable', 'catscan-detections'); ?></strong>
+                &mdash; <?php esc_html_e('check the ESP32 is powered on and ESP32_CONTROL_URL is correct.', 'catscan-detections'); ?>
+            <?php else : ?>
+                <strong style="color:#2271b1;"><?php esc_html_e('Online', 'catscan-detections'); ?></strong>
+                &mdash; <?php printf(esc_html__('last checked in %s ago', 'catscan-detections'), esc_html(human_time_diff($last_heartbeat, time()))); ?>
+            <?php endif; ?>
+        </p>
+        <?php if ($camera_reachable) : ?>
+            <table class="form-table">
+                <?php if (isset($device_status['uptime_s'])) : ?>
+                    <tr><th scope="row"><?php esc_html_e('Uptime', 'catscan-detections'); ?></th><td><?php echo esc_html(human_time_diff(time() - (int) $device_status['uptime_s'], time())); ?></td></tr>
+                <?php endif; ?>
+                <?php if (isset($device_status['wifi_rssi'])) : ?>
+                    <tr><th scope="row"><?php esc_html_e('Wi-Fi signal', 'catscan-detections'); ?></th><td><?php echo esc_html($device_status['wifi_rssi']); ?> dBm</td></tr>
+                <?php endif; ?>
+                <?php if (isset($device_status['dark'])) : ?>
+                    <tr><th scope="row"><?php esc_html_e('Ambient light', 'catscan-detections'); ?></th><td><?php echo $device_status['dark'] ? esc_html__('Dark', 'catscan-detections') : esc_html__('Light', 'catscan-detections'); ?></td></tr>
+                <?php endif; ?>
+                <?php if (isset($device_status['deterrent_enabled'])) : ?>
+                    <tr><th scope="row"><?php esc_html_e('Auto-deterrent', 'catscan-detections'); ?></th><td><?php echo $device_status['deterrent_enabled'] ? esc_html__('Enabled', 'catscan-detections') : esc_html__('Disabled', 'catscan-detections'); ?></td></tr>
+                <?php endif; ?>
+                <?php if (isset($device_status['seconds_since_last_capture']) && (int) $device_status['seconds_since_last_capture'] >= 0) : ?>
+                    <tr><th scope="row"><?php esc_html_e('Last capture', 'catscan-detections'); ?></th><td><?php printf(esc_html__('%s ago', 'catscan-detections'), esc_html(human_time_diff(time() - (int) $device_status['seconds_since_last_capture'], time()))); ?></td></tr>
+                <?php endif; ?>
+            </table>
+        <?php endif; ?>
+        <form method="post">
+            <?php wp_nonce_field('catscan_queue_command_action', 'catscan_command_nonce'); ?>
+            <button type="submit" name="catscan_queue_command" value="capture" class="button"><?php esc_html_e('Capture now', 'catscan-detections'); ?></button>
+            <button type="submit" name="catscan_queue_command" value="deter_test" class="button"><?php esc_html_e('Test deterrent', 'catscan-detections'); ?></button>
+            <button type="submit" name="catscan_queue_command" value="deterrent_on" class="button"><?php esc_html_e('Enable auto-deterrent', 'catscan-detections'); ?></button>
+            <button type="submit" name="catscan_queue_command" value="deterrent_off" class="button"><?php esc_html_e('Disable auto-deterrent', 'catscan-detections'); ?></button>
+            <button type="submit" name="catscan_queue_command" value="reboot" class="button button-secondary" onclick="return confirm('<?php echo esc_js(__('Reboot the device now?', 'catscan-detections')); ?>');"><?php esc_html_e('Reboot device', 'catscan-detections'); ?></button>
+            <p class="description"><?php esc_html_e('Commands are queued here and picked up by the server on its next status check (~20 seconds), then forwarded to the ESP32 - not instant.', 'catscan-detections'); ?></p>
         </form>
         <hr>
         <p><?php esc_html_e('Display recent detections anywhere with the shortcode:', 'catscan-detections'); ?> <code>[catscan_recent limit="12" label="all"]</code></p>

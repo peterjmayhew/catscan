@@ -8,6 +8,7 @@ WordPress and/or a generic notification webhook.
 """
 
 import hmac
+import logging
 import os
 import threading
 import time
@@ -18,10 +19,16 @@ import numpy as np
 import requests
 from flask import Flask, jsonify, request
 
+import remote_control
 import wordpress_client
 from detector import CatDetector
 
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+
 app = Flask(__name__)
+# A malicious or buggy client sending an oversized body shouldn't be able to
+# exhaust server memory - 15MB is generous for a single VGA/SVGA JPEG.
+app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 detector = CatDetector()
 
 CAPTURES_DIR = os.path.join(os.path.dirname(__file__), "..", "captures")
@@ -31,6 +38,12 @@ NOTIFY_WEBHOOK_URL = os.environ.get("NOTIFY_WEBHOOK_URL")
 # config.example.h). Unset by default - only enforced if you opt in, so
 # existing setups keep working unchanged.
 DEVICE_API_KEY = os.environ.get("DEVICE_API_KEY")
+
+# Every capture is saved to disk (see save_capture) and nothing ever
+# deleted them until now - left running for months, that grows without
+# bound. 0 disables cleanup and keeps everything forever.
+CAPTURES_RETENTION_DAYS = int(os.environ.get("CAPTURES_RETENTION_DAYS", 30))
+CAPTURES_CLEANUP_INTERVAL_SECONDS = 6 * 3600
 
 # A single frame is a noisy basis for "my cat or the neighbour's" - one bad
 # angle or motion-blurred frame can flip the verdict. The firmware sends a
@@ -119,7 +132,43 @@ def _handle_burst_result(result, image_path):
         wordpress_client.upload_detection(result, image_bgr, image_path)
 
     if result["label"] == "other_cat":
+        # Deterrent first, and directly to the ESP32 (not via WordPress) -
+        # this needs to happen in well under a second, not after a round
+        # trip through a hosted website.
+        remote_control.trigger_deterrent()
         notify(result, image_path)
+
+
+def _cleanup_old_captures():
+    if CAPTURES_RETENTION_DAYS <= 0 or not os.path.isdir(CAPTURES_DIR):
+        return
+
+    cutoff = time.time() - CAPTURES_RETENTION_DAYS * 86400
+    removed = 0
+    for label_name in os.listdir(CAPTURES_DIR):
+        label_dir = os.path.join(CAPTURES_DIR, label_name)
+        if not os.path.isdir(label_dir):
+            continue
+        for filename in os.listdir(label_dir):
+            file_path = os.path.join(label_dir, filename)
+            try:
+                if os.path.isfile(file_path) and os.path.getmtime(file_path) < cutoff:
+                    os.remove(file_path)
+                    removed += 1
+            except OSError as exc:
+                app.logger.warning("Could not remove old capture %s: %s", file_path, exc)
+
+    if removed:
+        app.logger.info("Cleaned up %d capture(s) older than %d days", removed, CAPTURES_RETENTION_DAYS)
+
+
+def _captures_cleanup_loop():
+    while True:
+        try:
+            _cleanup_old_captures()
+        except Exception:
+            app.logger.exception("Capture cleanup failed")
+        time.sleep(CAPTURES_CLEANUP_INTERVAL_SECONDS)
 
 
 def notify(result, image_path):
@@ -141,6 +190,7 @@ def health():
         "status": "ok",
         "mode": detector.mode,
         "wordpress_configured": wordpress_client.is_configured(),
+        "esp32_control_configured": remote_control.esp32_configured(),
     })
 
 
@@ -182,8 +232,16 @@ def detect():
     return jsonify(result)
 
 
+_cleanup_old_captures()  # run once at startup, then every CAPTURES_CLEANUP_INTERVAL_SECONDS
 threading.Thread(target=_burst_watchdog, daemon=True).start()
+threading.Thread(target=_captures_cleanup_loop, daemon=True).start()
+remote_control.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    # threaded=True so a slow outbound call (WordPress/cloud AI) on one
+    # request doesn't stall other incoming frames. For a real production
+    # deployment (not just "runs reliably on my home network"), put this
+    # behind a proper WSGI server (gunicorn/waitress) instead of Flask's
+    # built-in one - see README "Production deployment".
+    app.run(host="0.0.0.0", port=port, threaded=True)

@@ -76,4 +76,26 @@
 #define NTP_GMT_OFFSET_SEC 0       // e.g. 3600 for UTC+1
 #define NTP_DST_OFFSET_SEC 0       // e.g. 3600 if your zone observes DST
 
+// Local control server (port 80) for remote monitoring/control - the
+// Flask server polls /status and forwards commands from the WordPress
+// plugin's Device page to /command. Leave blank to disable auth on this
+// local server (fine if it's genuinely LAN-only and you trust your
+// network; set a key otherwise, matched by ESP32_CONTROL_KEY on the
+// server).
+#define CONTROL_API_KEY ""
+
+// Deterrent output - a buzzer, ultrasonic repeller module, or relay,
+// whatever you've wired up near the cat flap. Fired automatically when
+// the server confirms an "other_cat" detection (see README "Deterring the
+// neighbour's cat"). GPIO12 is a boot-strapping pin (MTDI) - wire your
+// driver circuit so it idles LOW (e.g. via a pull-down resistor), or boot
+// can become unreliable. Verify against your specific board if in doubt,
+// same caveat as the ultrasonic sensor's pins above.
+#define DETERRENT_PIN 12
+#define DETERRENT_ACTIVE_MS 3000        // how long the deterrent stays on
+#define DETERRENT_COOLDOWN_MS 10000     // minimum gap between activations
+#define DETERRENT_ENABLED_DEFAULT true  // used only on first-ever boot; the
+                                         // on/off toggle is remembered in
+                                         // flash after that (survives reboots)
+
 #endif

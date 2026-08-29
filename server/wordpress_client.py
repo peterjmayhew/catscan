@@ -56,19 +56,69 @@ def upload_detection(result, image_bgr, image_path):
         "reasoning": result.get("reasoning", ""),
         "captured_at": captured_at,
     }
-    files = {"image": ("capture.jpg", buffer.tobytes(), "image/jpeg")}
+    image_bytes = buffer.tobytes()
     headers = {"X-API-Key": WORDPRESS_API_KEY}
 
+    for attempt in range(2):
+        try:
+            response = requests.post(
+                f"{WORDPRESS_URL}/wp-json/catscan/v1/detections",
+                data=fields,
+                files={"image": ("capture.jpg", image_bytes, "image/jpeg")},
+                headers=headers,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status is not None and 400 <= status < 500 and status != 429:
+                # A bad request/auth/rate-limit-exempt client error won't be
+                # fixed by retrying - fail fast instead of wasting a retry.
+                logger.warning("WordPress upload rejected (%s), not retrying: %s", status, exc)
+                return None
+            logger.warning("WordPress upload failed (attempt %d/2): %s", attempt + 1, exc)
+        except requests.RequestException as exc:
+            logger.warning("WordPress upload failed (attempt %d/2): %s", attempt + 1, exc)
+
+        if attempt == 0:
+            time.sleep(2)
+
+    return None
+
+
+def upload_heartbeat(status):
+    """Pushes a device status snapshot (uptime, Wi-Fi signal, etc. - see
+    remote_control.py) to WordPress's Settings -> CatScan -> Device page.
+    Best-effort; failures are logged and swallowed, same as detections."""
+    if not is_configured():
+        return
     try:
         response = requests.post(
-            f"{WORDPRESS_URL}/wp-json/catscan/v1/detections",
-            data=fields,
-            files=files,
-            headers=headers,
+            f"{WORDPRESS_URL}/wp-json/catscan/v1/heartbeat",
+            json=status,
+            headers={"X-API-Key": WORDPRESS_API_KEY},
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
-        return response.json()
     except requests.RequestException as exc:
-        logger.warning("WordPress upload failed: %s", exc)
+        logger.warning("Heartbeat upload failed: %s", exc)
+
+
+def fetch_pending_command():
+    """Returns a command string queued from the Device admin page, or None
+    if there isn't one or the request failed. WordPress clears the command
+    as soon as it's fetched, so this call also acts as the dequeue."""
+    if not is_configured():
+        return None
+    try:
+        response = requests.get(
+            f"{WORDPRESS_URL}/wp-json/catscan/v1/pending-command",
+            headers={"X-API-Key": WORDPRESS_API_KEY},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        return response.json().get("command") or None
+    except requests.RequestException as exc:
+        logger.warning("Could not fetch pending command: %s", exc)
         return None

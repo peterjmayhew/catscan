@@ -31,6 +31,7 @@ import cv2
 REFERENCE_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "reference_photos")
 MODEL_NAME = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
 MAX_REFERENCE_PHOTOS = 6  # keeps each request small, fast, and cheap
+REQUEST_TIMEOUT_SECONDS = 30.0
 
 SYSTEM_PROMPT = (
     "You are a strict JSON API for a home cat-identification camera. "
@@ -55,7 +56,7 @@ class CloudClassifier:
     def __init__(self):
         # Raises if ANTHROPIC_API_KEY isn't set - caller treats that as
         # "cloud backend not configured" and falls back to another mode.
-        self._client = anthropic.Anthropic()
+        self._client = anthropic.Anthropic(timeout=REQUEST_TIMEOUT_SECONDS)
         self._reference_images = self._load_reference_images()
         if not self._reference_images:
             raise RuntimeError(f"No reference photos found in {REFERENCE_DIR}")
@@ -101,12 +102,34 @@ class CloudClassifier:
             }
         )
 
-        response = self._client.messages.create(
-            model=MODEL_NAME,
-            max_tokens=200,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": content}],
-        )
+        try:
+            response = self._client.messages.create(
+                model=MODEL_NAME,
+                max_tokens=200,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": content}],
+            )
+        except anthropic.APIError as exc:
+            # A transient API hiccup shouldn't take the whole /detect
+            # request down (and with it, this frame's place in the burst) -
+            # report it as "unknown" instead of raising, same as an
+            # unparseable reply below.
+            return {
+                "cat_detected": False,
+                "label": "no_cat",
+                "confidence": 0.0,
+                "mode": "cloud",
+                "reasoning": f"cloud API error: {exc}",
+            }
+
+        if not response.content or response.content[0].type != "text":
+            return {
+                "cat_detected": False,
+                "label": "no_cat",
+                "confidence": 0.0,
+                "mode": "cloud",
+                "reasoning": "cloud response had no text content",
+            }
         raw_text = response.content[0].text
 
         try:

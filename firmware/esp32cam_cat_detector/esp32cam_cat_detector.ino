@@ -8,10 +8,14 @@
 // in your Wi-Fi + server details) and the ESP32 Arduino core installed.
 
 #include <ArduinoOTA.h>
+#include <Preferences.h>
+#include <WebServer.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <time.h>
 #include "esp_camera.h"
+#include "soc/rtc_cntl_reg.h"
+#include "soc/soc.h"
 #include "config.h"
 
 // ---- AI-Thinker / Freenove ESP32-CAM pin map ----
@@ -55,6 +59,15 @@ const unsigned long WIFI_MAX_RETRY_DELAY_MS = 30000;
 // this project could possibly have been built) rather than its un-synced
 // default of "seconds since boot from 1970".
 const time_t NTP_SANITY_EPOCH = 1700000000; // 2023-11-14
+
+// Local control server: lets the Flask server (as a bridge to the
+// WordPress plugin) check status and send commands over the LAN.
+WebServer controlServer(80);
+Preferences preferences;
+bool deterrentAutoEnabled = true;
+unsigned long deterrentOffAtMillis = 0;   // 0 = not currently active
+unsigned long lastDeterrentFireMillis = 0; // 0 = never fired this boot
+volatile bool manualCaptureRequested = false;
 
 bool initCamera() {
   camera_config_t config;
@@ -132,6 +145,107 @@ bool isDark() {
   return analogRead(LDR_PIN) < DARK_ADC_THRESHOLD;
 }
 
+// Fires the deterrent output, respecting a minimum cooldown between
+// activations. force=true (used by the manual "deter_test" command)
+// bypasses the deterrentAutoEnabled toggle, so wiring can be verified even
+// while auto-fire is switched off.
+void fireDeterrent(bool force) {
+  if (!force && !deterrentAutoEnabled) {
+    Serial.println("Deterrent auto-fire is disabled - ignoring.");
+    return;
+  }
+  unsigned long now = millis();
+  if (lastDeterrentFireMillis != 0 && now - lastDeterrentFireMillis < DETERRENT_COOLDOWN_MS) {
+    Serial.println("Deterrent still on cooldown - ignoring.");
+    return;
+  }
+  Serial.println("Firing deterrent.");
+  digitalWrite(DETERRENT_PIN, HIGH);
+  deterrentOffAtMillis = now + DETERRENT_ACTIVE_MS;
+  lastDeterrentFireMillis = now;
+}
+
+// Non-blocking auto-off - call every loop() iteration.
+void maintainDeterrent() {
+  if (deterrentOffAtMillis != 0 && millis() >= deterrentOffAtMillis) {
+    digitalWrite(DETERRENT_PIN, LOW);
+    deterrentOffAtMillis = 0;
+  }
+}
+
+// Returns false (and sends a 401) if CONTROL_API_KEY is set but the
+// request didn't supply a matching X-Control-Key header. Auth is skipped
+// entirely if CONTROL_API_KEY is left blank.
+bool checkControlAuth() {
+  if (strlen(CONTROL_API_KEY) == 0) {
+    return true;
+  }
+  if (controlServer.header("X-Control-Key") != CONTROL_API_KEY) {
+    controlServer.send(401, "text/plain", "unauthorized");
+    return false;
+  }
+  return true;
+}
+
+void handleStatus() {
+  if (!checkControlAuth()) {
+    return;
+  }
+  String json = "{";
+  json += "\"uptime_s\":" + String(millis() / 1000UL) + ",";
+  json += "\"free_heap\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"wifi_rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"dark\":" + String(isDark() ? "true" : "false") + ",";
+  json += "\"deterrent_enabled\":" + String(deterrentAutoEnabled ? "true" : "false") + ",";
+  // Built as an explicit `long` rather than inline in the ternary: mixing
+  // unsigned long (the division result) and int (-1) in one ternary
+  // expression forces -1 to convert to an unsigned long (4294967295)
+  // instead of staying -1, silently corrupting the "no capture yet" case.
+  long secondsSinceLastCapture =
+      lastCaptureMillis > 0 ? (long)((millis() - lastCaptureMillis) / 1000UL) : -1;
+  json += "\"seconds_since_last_capture\":" + String(secondsSinceLastCapture);
+  json += "}";
+  controlServer.send(200, "application/json", json);
+}
+
+// Commands (sent as a form field, e.g. POST /command with body
+// "command=reboot"): reboot, capture, deter, deter_test, deterrent_on,
+// deterrent_off. See README "Remote control" for what queues these from
+// WordPress.
+void handleCommand() {
+  if (!checkControlAuth()) {
+    return;
+  }
+
+  String command = controlServer.arg("command");
+  Serial.printf("Received control command: %s\n", command.c_str());
+
+  if (command == "reboot") {
+    controlServer.send(200, "text/plain", "rebooting");
+    delay(300); // let the response actually get sent before we restart
+    ESP.restart();
+  } else if (command == "capture") {
+    manualCaptureRequested = true;
+    controlServer.send(200, "text/plain", "capture queued");
+  } else if (command == "deter") {
+    // The automatic path from the server on a real "other_cat" detection -
+    // respects the deterrentAutoEnabled toggle.
+    fireDeterrent(false);
+    controlServer.send(200, "text/plain", "ok");
+  } else if (command == "deter_test") {
+    // Manual test from the WordPress Device page - always fires, so
+    // wiring can be verified even with auto-fire switched off.
+    fireDeterrent(true);
+    controlServer.send(200, "text/plain", "deterrent fired");
+  } else if (command == "deterrent_on" || command == "deterrent_off") {
+    deterrentAutoEnabled = (command == "deterrent_on");
+    preferences.putBool("deter_on", deterrentAutoEnabled);
+    controlServer.send(200, "text/plain", deterrentAutoEnabled ? "enabled" : "disabled");
+  } else {
+    controlServer.send(400, "text/plain", "unknown command");
+  }
+}
+
 // Runs once each time Wi-Fi (re)connects: starts NTP sync and (re)arms OTA,
 // since both can need re-establishing after a connection drop.
 void onWiFiConnected() {
@@ -190,6 +304,7 @@ bool sendFrameToServer(camera_fb_t *fb) {
   for (int attempt = 1; attempt <= 2; attempt++) {
     HTTPClient http;
     http.begin(SERVER_URL);
+    http.setTimeout(8000); // don't let a stalled connection hang a whole burst
     http.addHeader("Content-Type", "image/jpeg");
     if (strlen(DEVICE_API_KEY) > 0) {
       http.addHeader("X-Device-Key", DEVICE_API_KEY);
@@ -246,21 +361,40 @@ void captureAndSend() {
 }
 
 void setup() {
+  // ESP32-CAM boards are prone to spurious brownout resets under the
+  // current spikes Wi-Fi + flash LED use cause, especially on marginal
+  // USB power - a very common real-world reliability fix.
+  WRITE_PERI_REG(RTC_CNTL_BROWNOUT_DET_ENA_REG, 0);
+
   Serial.begin(115200);
   pinMode(PIR_PIN, INPUT);
   pinMode(FLASH_PIN, OUTPUT);
   digitalWrite(FLASH_PIN, LOW);
+  pinMode(DETERRENT_PIN, OUTPUT);
+  digitalWrite(DETERRENT_PIN, LOW);
 
   if (USE_ULTRASONIC) {
     pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
     pinMode(ULTRASONIC_ECHO_PIN, INPUT);
   }
 
-  if (!initCamera()) {
-    Serial.println("Halting: camera init failed.");
-    while (true) {
-      delay(1000);
+  preferences.begin("catscan", false);
+  deterrentAutoEnabled = preferences.getBool("deter_on", DETERRENT_ENABLED_DEFAULT);
+
+  // Camera init failures are usually a transient power glitch at boot;
+  // retry a few times before giving up and restarting the whole device,
+  // rather than hanging dead until someone physically power-cycles it.
+  int cameraInitAttempts = 0;
+  while (!initCamera()) {
+    cameraInitAttempts++;
+    Serial.printf("Camera init failed (attempt %d).\n", cameraInitAttempts);
+    if (cameraInitAttempts >= 5) {
+      Serial.println("Giving up after 5 attempts - restarting.");
+      delay(500);
+      ESP.restart();
     }
+    esp_camera_deinit(); // clean up before retrying, in case of partial init
+    delay(2000);
   }
 
   ArduinoOTA.setHostname("catscan-esp32cam");
@@ -279,6 +413,12 @@ void setup() {
   }
   Serial.println();
 
+  const char *controlHeaderKeys[] = {"X-Control-Key"};
+  controlServer.collectHeaders(controlHeaderKeys, 1);
+  controlServer.on("/status", HTTP_GET, handleStatus);
+  controlServer.on("/command", HTTP_POST, handleCommand);
+  controlServer.begin();
+
   Serial.println("Ready - watching PIR" +
                   String(USE_ULTRASONIC ? " + ultrasonic sensor" : " sensor") +
                   " for motion.");
@@ -289,6 +429,8 @@ void loop() {
   if (WiFi.status() == WL_CONNECTED) {
     ArduinoOTA.handle();
   }
+  controlServer.handleClient();
+  maintainDeterrent();
   maybeRestartDaily();
 
   bool pirTriggered = digitalRead(PIR_PIN) == HIGH;
@@ -304,11 +446,12 @@ void loop() {
   bool cooldownElapsed =
       (now - lastCaptureMillis) >= (unsigned long)CAPTURE_COOLDOWN_SECONDS * 1000UL;
 
-  if (motionDetected && cooldownElapsed) {
-    Serial.printf("Motion detected (PIR=%d, ultrasonic=%d, dark=%d) - capturing frame.\n",
-                  pirTriggered, ultrasonicTriggered, isDark());
+  if ((motionDetected && cooldownElapsed) || manualCaptureRequested) {
+    Serial.printf("Capturing (PIR=%d, ultrasonic=%d, manual=%d, dark=%d).\n",
+                  pirTriggered, ultrasonicTriggered, manualCaptureRequested, isDark());
     captureAndSend();
     lastCaptureMillis = now;
+    manualCaptureRequested = false;
   }
 
   delay(200);
